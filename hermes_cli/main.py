@@ -9837,8 +9837,9 @@ Examples:
         description=(
             "Set up and manage external memory provider plugins.\n\n"
             "Available providers: honcho, openviking, mem0, hindsight,\n"
-            "holographic, retaindb, byterover.\n\n"
-            "Only one external provider can be active at a time.\n"
+            "holographic, retaindb, byterover, mnemosyne.\n\n"
+            "Multiple providers can be active simultaneously.\n"
+            "Results are merged across all active providers.\n"
             "Built-in memory (MEMORY.md/USER.md) is always active."
         ),
     )
@@ -9847,7 +9848,7 @@ Examples:
         "setup", help="Interactive provider selection and configuration"
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
-    memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+    memory_sub.add_parser("off", help="Disable all external providers (built-in only)")
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",
@@ -9874,6 +9875,7 @@ Examples:
             if not isinstance(config.get("memory"), dict):
                 config["memory"] = {}
             config["memory"]["provider"] = ""
+            config["memory"]["providers"] = []
             save_config(config)
             print("\n  ✓ Memory provider: built-in only")
             print("  Saved to config.yaml\n")

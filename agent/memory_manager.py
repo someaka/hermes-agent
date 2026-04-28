@@ -1,4 +1,5 @@
-"""MemoryManager — orchestrates memory providers for the agent.
+"""MemoryManager — orchestrates the built-in memory provider plus one or
+more external plugin memory providers.
 
 Single integration point in run_agent.py. Replaces scattered per-backend
 code with one manager that delegates to registered providers.
@@ -10,8 +11,10 @@ all active providers at runtime.
 
 Usage in run_agent.py:
     self._memory_manager = MemoryManager()
-    # Only ONE of these:
-    self._memory_manager.add_provider(plugin_provider)
+    self._memory_manager.add_provider(BuiltinMemoryProvider(...))
+    # One or more external providers:
+    for provider in external_providers:
+        self._memory_manager.add_provider(provider)
 
     # System prompt
     prompt_parts.append(self._memory_manager.build_system_prompt())
@@ -220,8 +223,16 @@ class MemoryManager:
                 )
                 return
 
-        # Collect tool schemas BEFORE mutating state
-        schemas = provider.get_tool_schemas()
+        # Collect tool schemas BEFORE mutating state — if schema loading
+        # fails the provider must NOT be registered (fixes #9948).
+        try:
+            schemas = provider.get_tool_schemas()
+        except Exception as exc:
+            logger.error(
+                "Memory provider '%s' failed during schema loading: %s — NOT registered",
+                provider.name, exc,
+            )
+            return
 
         self._providers.append(provider)
 

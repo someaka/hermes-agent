@@ -1,6 +1,7 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
+import logging
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -239,6 +240,47 @@ class TestMemoryManager:
         mgr.add_provider(ext2)
         assert len(mgr.providers) == 1
         assert mgr.providers[0] is ext2
+
+    def test_schema_loading_failure_prevents_registration(self):
+        """If get_tool_schemas() raises, the provider is NOT registered."""
+        mgr = MemoryManager()
+        bad = FakeMemoryProvider("bad")
+        bad.get_tool_schemas = MagicMock(side_effect=RuntimeError("schema boom"))
+
+        mgr.add_provider(bad)  # must not raise
+
+        assert len(mgr.providers) == 0
+        assert mgr.get_provider("bad") is None
+
+    def test_namespace_prefix_warning_on_mismatch(self):
+        """A warning is logged when tool names don't match provider prefix."""
+        mgr = MemoryManager()
+        # Provider name "holographic" but tools use "fact_" prefix
+        p = FakeMemoryProvider("holographic", tools=[
+            {"name": "fact_store", "description": "Store", "parameters": {}},
+        ])
+
+        with patch("agent.memory_manager.logger") as mock_log:
+            mgr.add_provider(p)
+            # Should have logged a namespace warning
+            warning_calls = [c for c in mock_log.warning.call_args_list
+                             if "naming convention" in str(c)]
+            assert len(warning_calls) >= 1
+
+    def test_tool_budget_warning_above_threshold(self):
+        """A warning is logged when total tools exceed 20."""
+        mgr = MemoryManager()
+        # Create a provider with 25 tools
+        tools = [{"name": f"ext_tool_{i}", "description": f"Tool {i}", "parameters": {}}
+                 for i in range(25)]
+        p = FakeMemoryProvider("ext", tools=tools)
+        mgr.add_provider(p)
+
+        with patch("agent.memory_manager.logger") as mock_log:
+            mgr.get_all_tool_schemas()
+            warning_calls = [c for c in mock_log.warning.call_args_list
+                             if "budget" in str(c).lower()]
+            assert len(warning_calls) >= 1
 
     def test_system_prompt_merges_blocks(self):
         mgr = MemoryManager()

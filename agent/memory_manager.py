@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import re
 import inspect
+import threading
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -202,6 +203,7 @@ class MemoryManager:
     def __init__(self) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
+        self._lock = threading.RLock()
 
     # -- Registration --------------------------------------------------------
 
@@ -212,59 +214,60 @@ class MemoryManager:
         Multiple external providers are allowed, but duplicate names are
         rejected with a warning.
         """
-        is_builtin = provider.name == "builtin"
+        with self._lock:
+            is_builtin = provider.name == "builtin"
 
-        if not is_builtin:
-            # Check for duplicate provider name
-            if any(p.name == provider.name for p in self._providers if p.name != "builtin"):
-                logger.warning(
-                    "Memory provider '%s' is already registered; skipping duplicate.",
-                    provider.name,
+            if not is_builtin:
+                # Check for duplicate provider name
+                if any(p.name == provider.name for p in self._providers if p.name != "builtin"):
+                    logger.warning(
+                        "Memory provider '%s' is already registered; skipping duplicate.",
+                        provider.name,
+                    )
+                    return
+
+            # Collect tool schemas BEFORE mutating state — if schema loading
+            # fails the provider must NOT be registered (fixes #9948).
+            try:
+                schemas = provider.get_tool_schemas()
+            except Exception as exc:
+                logger.error(
+                    "Memory provider '%s' failed during schema loading: %s — NOT registered",
+                    provider.name, exc,
                 )
                 return
 
-        # Collect tool schemas BEFORE mutating state — if schema loading
-        # fails the provider must NOT be registered (fixes #9948).
-        try:
-            schemas = provider.get_tool_schemas()
-        except Exception as exc:
-            logger.error(
-                "Memory provider '%s' failed during schema loading: %s — NOT registered",
-                provider.name, exc,
+            self._providers.append(provider)
+
+            # Index tool names → provider for routing
+            for schema in schemas:
+                tool_name = schema.get("name", "")
+                if tool_name and tool_name not in self._tool_to_provider:
+                    self._tool_to_provider[tool_name] = provider
+                elif tool_name in self._tool_to_provider:
+                    logger.warning(
+                        "Memory tool name conflict: '%s' already registered by %s, "
+                        "ignoring from %s",
+                        tool_name,
+                        self._tool_to_provider[tool_name].name,
+                        provider.name,
+                    )
+
+            # Namespace validation — warn if tool names don't follow convention
+            for schema in schemas:
+                tool_name = schema.get("name", "")
+                if provider.name != "builtin" and not tool_name.startswith(provider.name[:4]):
+                    logger.warning(
+                        "Provider '%s' tool '%s' does not follow naming convention '<provider>_<action>'.",
+                        provider.name, tool_name,
+                    )
+
+            ext_count = sum(1 for p in self._providers if p.name != "builtin")
+            total_tools = len(self._tool_to_provider)
+            logger.info(
+                "Memory provider '%s' registered (%d tools). Active: %d external, %d total tools.",
+                provider.name, len(schemas), ext_count, total_tools,
             )
-            return
-
-        self._providers.append(provider)
-
-        # Index tool names → provider for routing
-        for schema in schemas:
-            tool_name = schema.get("name", "")
-            if tool_name and tool_name not in self._tool_to_provider:
-                self._tool_to_provider[tool_name] = provider
-            elif tool_name in self._tool_to_provider:
-                logger.warning(
-                    "Memory tool name conflict: '%s' already registered by %s, "
-                    "ignoring from %s",
-                    tool_name,
-                    self._tool_to_provider[tool_name].name,
-                    provider.name,
-                )
-
-        # Namespace validation — warn if tool names don't follow convention
-        for schema in schemas:
-            tool_name = schema.get("name", "")
-            if provider.name != "builtin" and not tool_name.startswith(provider.name[:4]):
-                logger.warning(
-                    "Provider '%s' tool '%s' does not follow naming convention '<provider>_<action>'.",
-                    provider.name, tool_name,
-                )
-
-        ext_count = sum(1 for p in self._providers if p.name != "builtin")
-        total_tools = len(self._tool_to_provider)
-        logger.info(
-            "Memory provider '%s' registered (%d tools). Active: %d external, %d total tools.",
-            provider.name, len(schemas), ext_count, total_tools,
-        )
 
     @property
     def providers(self) -> List[MemoryProvider]:
@@ -284,25 +287,26 @@ class MemoryManager:
             logger.warning("Cannot remove builtin memory provider")
             return False
 
-        for i, p in enumerate(self._providers):
-            if p.name == name:
-                # Remove tool mappings
-                tools_to_remove = [t for t, prov in self._tool_to_provider.items() if prov is p]
-                for t in tools_to_remove:
-                    del self._tool_to_provider[t]
+        with self._lock:
+            for i, p in enumerate(self._providers):
+                if p.name == name:
+                    # Remove tool mappings
+                    tools_to_remove = [t for t, prov in self._tool_to_provider.items() if prov is p]
+                    for t in tools_to_remove:
+                        del self._tool_to_provider[t]
 
-                # Shutdown the provider
-                try:
-                    p.shutdown()
-                except Exception as exc:
-                    logger.warning("Provider '%s' shutdown failed: %s", name, exc)
+                    # Shutdown the provider
+                    try:
+                        p.shutdown()
+                    except Exception as exc:
+                        logger.warning("Provider '%s' shutdown failed: %s", name, exc)
 
-                self._providers.pop(i)
-                logger.info("Memory provider '%s' removed (had %d tools)", name, len(tools_to_remove))
-                return True
+                    self._providers.pop(i)
+                    logger.info("Memory provider '%s' removed (had %d tools)", name, len(tools_to_remove))
+                    return True
 
-        logger.warning("Provider '%s' not found for removal", name)
-        return False
+            logger.warning("Provider '%s' not found for removal", name)
+            return False
 
     # -- System prompt -------------------------------------------------------
 

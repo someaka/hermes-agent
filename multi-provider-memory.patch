@@ -1,0 +1,1552 @@
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 80b0a9b45..9e2e8a0b1 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -724,7 +724,7 @@ class ContextCompressor(ContextEngine):
+ 
+         return "\n\n".join(parts)
+ 
+-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
++    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None, memory_context: str = "") -> Optional[str]:
+         """Generate a structured summary of conversation turns.
+ 
+         Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
+@@ -866,6 +866,17 @@ Use this exact structure:
+ FOCUS TOPIC: "{focus_topic}"
+ The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+ 
++        # Inject memory provider context extracted before compression.
++        # This contains insights or notes the memory provider wants to
++        # preserve before the conversation context is discarded.
++        if memory_context:
++            prompt += f"""
++
++MEMORY PROVIDER CONTEXT:
++The following context was extracted by active memory providers before this compaction. Treat it as additional important information that MUST be preserved in the summary:
++
++{memory_context}"""
++
+         try:
+             call_kwargs = {
+                 "task": "compression",
+@@ -1275,7 +1286,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+     # Main compression entry point
+     # ------------------------------------------------------------------
+ 
+-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
++    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, memory_context: str = "") -> List[Dict[str, Any]]:
+         """Compress conversation messages by summarizing middle turns.
+ 
+         Algorithm:
+@@ -1366,7 +1377,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+             )
+ 
+         # Phase 3: Generate structured summary
+-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
++        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+ 
+         # Phase 4: Assemble compressed message list
+         compressed = []
+diff --git a/agent/context_engine.py b/agent/context_engine.py
+index bbafcd29c..1762a71a0 100644
+--- a/agent/context_engine.py
++++ b/agent/context_engine.py
+@@ -79,6 +79,7 @@ class ContextEngine(ABC):
+         messages: List[Dict[str, Any]],
+         current_tokens: int = None,
+         focus_topic: str = None,
++        memory_context: str = "",
+     ) -> List[Dict[str, Any]]:
+         """Compact the message list and return the new message list.
+ 
+@@ -93,6 +94,10 @@ class ContextEngine(ABC):
+                 Engines that support guided compression should prioritise
+                 preserving information related to this topic.  Engines that
+                 don't support it may simply ignore this argument.
++            memory_context: Optional context string from the memory provider's
++                ``on_pre_compress`` hook.  Contains insights or notes the
++                provider wants preserved across compaction.  Engines that
++                don't use it may simply ignore this argument.
+         """
+ 
+     # -- Optional: pre-flight check ----------------------------------------
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 1319681d3..c1594c1ab 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -1,16 +1,20 @@
+-"""MemoryManager — orchestrates memory providers for the agent.
++"""MemoryManager — orchestrates the built-in memory provider plus one or
++more external plugin memory providers.
+ 
+ Single integration point in run_agent.py. Replaces scattered per-backend
+ code with one manager that delegates to registered providers.
+ 
+-Only ONE external plugin provider is allowed at a time — attempting to
+-register a second external provider is rejected with a warning.  This
+-prevents tool schema bloat and conflicting memory backends.
++The BuiltinMemoryProvider is always registered first and cannot be removed.
++Multiple external providers can be active simultaneously via the
++``memory.providers`` list in config.yaml.  Results are merged across
++all active providers at runtime.
+ 
+ Usage in run_agent.py:
+     self._memory_manager = MemoryManager()
+-    # Only ONE of these:
+-    self._memory_manager.add_provider(plugin_provider)
++    self._memory_manager.add_provider(BuiltinMemoryProvider(...))
++    # One or more external providers:
++    for provider in external_providers:
++        self._memory_manager.add_provider(provider)
+ 
+     # System prompt
+     prompt_parts.append(self._memory_manager.build_system_prompt())
+@@ -28,6 +32,7 @@ from __future__ import annotations
+ import logging
+ import re
+ import inspect
++import threading
+ from typing import Any, Dict, List, Optional
+ 
+ from agent.memory_provider import MemoryProvider
+@@ -188,16 +193,17 @@ def build_memory_context_block(raw_context: str) -> str:
+ 
+ 
+ class MemoryManager:
+-    """Orchestrates the built-in provider plus at most one external provider.
++    """Orchestrates the built-in provider plus any external providers.
+ 
+-    The builtin provider is always first. Only one non-builtin (external)
+-    provider is allowed.  Failures in one provider never block the other.
++    The builtin provider is always first. Multiple non-builtin (external)
++    providers are allowed, but duplicate names are rejected.
++    Failures in one provider never block the others.
+     """
+ 
+     def __init__(self) -> None:
+         self._providers: List[MemoryProvider] = []
+         self._tool_to_provider: Dict[str, MemoryProvider] = {}
+-        self._has_external: bool = False  # True once a non-builtin provider is added
++        self._lock = threading.RLock()
+ 
+     # -- Registration --------------------------------------------------------
+ 
+@@ -205,47 +211,63 @@ class MemoryManager:
+         """Register a memory provider.
+ 
+         Built-in provider (name ``"builtin"``) is always accepted.
+-        Only **one** external (non-builtin) provider is allowed — a second
+-        attempt is rejected with a warning.
++        Multiple external providers are allowed, but duplicate names are
++        rejected with a warning.
+         """
+-        is_builtin = provider.name == "builtin"
++        with self._lock:
++            is_builtin = provider.name == "builtin"
++
++            if not is_builtin:
++                # Check for duplicate provider name
++                if any(p.name == provider.name for p in self._providers if p.name != "builtin"):
++                    logger.warning(
++                        "Memory provider '%s' is already registered; skipping duplicate.",
++                        provider.name,
++                    )
++                    return
+ 
+-        if not is_builtin:
+-            if self._has_external:
+-                existing = next(
+-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
+-                )
+-                logger.warning(
+-                    "Rejected memory provider '%s' — external provider '%s' is "
+-                    "already registered. Only one external memory provider is "
+-                    "allowed at a time. Configure which one via memory.provider "
+-                    "in config.yaml.",
+-                    provider.name, existing,
++            # Collect tool schemas BEFORE mutating state — if schema loading
++            # fails the provider must NOT be registered (fixes #9948).
++            try:
++                schemas = provider.get_tool_schemas()
++            except Exception as exc:
++                logger.error(
++                    "Memory provider '%s' failed during schema loading: %s — NOT registered",
++                    provider.name, exc,
+                 )
+                 return
+-            self._has_external = True
+ 
+-        self._providers.append(provider)
++            self._providers.append(provider)
++
++            # Index tool names → provider for routing
++            for schema in schemas:
++                tool_name = schema.get("name", "")
++                if tool_name and tool_name not in self._tool_to_provider:
++                    self._tool_to_provider[tool_name] = provider
++                elif tool_name in self._tool_to_provider:
++                    logger.warning(
++                        "Memory tool name conflict: '%s' already registered by %s, "
++                        "ignoring from %s",
++                        tool_name,
++                        self._tool_to_provider[tool_name].name,
++                        provider.name,
++                    )
+ 
+-        # Index tool names → provider for routing
+-        for schema in provider.get_tool_schemas():
+-            tool_name = schema.get("name", "")
+-            if tool_name and tool_name not in self._tool_to_provider:
+-                self._tool_to_provider[tool_name] = provider
+-            elif tool_name in self._tool_to_provider:
+-                logger.warning(
+-                    "Memory tool name conflict: '%s' already registered by %s, "
+-                    "ignoring from %s",
+-                    tool_name,
+-                    self._tool_to_provider[tool_name].name,
+-                    provider.name,
+-                )
++            # Namespace validation — warn if tool names don't follow convention
++            for schema in schemas:
++                tool_name = schema.get("name", "")
++                if provider.name != "builtin" and not tool_name.startswith(provider.name[:4]):
++                    logger.warning(
++                        "Provider '%s' tool '%s' does not follow naming convention '<provider>_<action>'.",
++                        provider.name, tool_name,
++                    )
+ 
+-        logger.info(
+-            "Memory provider '%s' registered (%d tools)",
+-            provider.name,
+-            len(provider.get_tool_schemas()),
+-        )
++            ext_count = sum(1 for p in self._providers if p.name != "builtin")
++            total_tools = len(self._tool_to_provider)
++            logger.info(
++                "Memory provider '%s' registered (%d tools). Active: %d external, %d total tools.",
++                provider.name, len(schemas), ext_count, total_tools,
++            )
+ 
+     @property
+     def providers(self) -> List[MemoryProvider]:
+@@ -259,6 +281,33 @@ class MemoryManager:
+                 return p
+         return None
+ 
++    def remove_provider(self, name: str) -> bool:
++        """Deregister a memory provider by name. Returns True if removed."""
++        if name == "builtin":
++            logger.warning("Cannot remove builtin memory provider")
++            return False
++
++        with self._lock:
++            for i, p in enumerate(self._providers):
++                if p.name == name:
++                    # Remove tool mappings
++                    tools_to_remove = [t for t, prov in self._tool_to_provider.items() if prov is p]
++                    for t in tools_to_remove:
++                        del self._tool_to_provider[t]
++
++                    # Shutdown the provider
++                    try:
++                        p.shutdown()
++                    except Exception as exc:
++                        logger.warning("Provider '%s' shutdown failed: %s", name, exc)
++
++                    self._providers.pop(i)
++                    logger.info("Memory provider '%s' removed (had %d tools)", name, len(tools_to_remove))
++                    return True
++
++            logger.warning("Provider '%s' not found for removal", name)
++            return False
++
+     # -- System prompt -------------------------------------------------------
+ 
+     def build_system_prompt(self) -> str:
+@@ -327,8 +376,15 @@ class MemoryManager:
+ 
+     # -- Tools ---------------------------------------------------------------
+ 
+-    def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
+-        """Collect tool schemas from all providers."""
++    def get_all_tool_schemas(self, *, toolsets_enabled: set = None) -> List[Dict[str, Any]]:
++        """Collect tool schemas from all providers.
++
++        If *toolsets_enabled* is provided and does not contain ``'memory'``,
++        skip memory tools entirely (they depend on the memory toolset).
++        """
++        if toolsets_enabled is not None and 'memory' not in toolsets_enabled:
++            return []
++
+         schemas = []
+         seen = set()
+         for provider in self._providers:
+@@ -343,6 +399,15 @@ class MemoryManager:
+                     "Memory provider '%s' get_tool_schemas() failed: %s",
+                     provider.name, e,
+                 )
++
++        TOOL_BUDGET_WARN_THRESHOLD = 20
++        total_memory_tools = len(self._tool_to_provider)
++        if total_memory_tools > TOOL_BUDGET_WARN_THRESHOLD:
++            logger.warning(
++                "Memory tool budget: %d tools registered (threshold: %d). May degrade tool-calling accuracy.",
++                total_memory_tools, TOOL_BUDGET_WARN_THRESHOLD,
++            )
++
+         return schemas
+ 
+     def get_all_tool_names(self) -> set:
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index c9abc48c7..dc35ef0cc 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -1,12 +1,14 @@
+ """Abstract base class for pluggable memory providers.
+ 
+-Memory providers give the agent persistent recall across sessions.
+-The MemoryManager enforces a one-external-provider limit to prevent
+-tool schema bloat and conflicting memory backends.
+-
+-External providers (Honcho, Hindsight, Mem0, etc.) are registered
+-and managed via MemoryManager. Only one external provider runs at a
+-time.
++Memory providers give the agent persistent recall across sessions. One or
++more external providers can be active simultaneously alongside the always-on
++built-in memory (MEMORY.md / USER.md). The ``memory.providers`` list in
++config.yaml controls which external providers are loaded.
++
++Built-in memory is always active as the first provider and cannot be removed.
++External providers (Honcho, Hindsight, Mem0, etc.) are additive — they never
++disable the built-in store.  Multiple external providers can run
++simultaneously via the ``memory.providers`` list in config.yaml.
+ 
+ Registration:
+   Plugins ship in plugins/memory/<name>/ and are activated via
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 1e040c368..f62581b43 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -976,8 +976,13 @@ DEFAULT_CONFIG = {
+         # External memory provider plugin (empty = built-in only).
+         # Set to a provider name to activate: "openviking", "mem0",
+         # "hindsight", "holographic", "retaindb", "byterover".
+-        # Only ONE external provider is allowed at a time.
++        # Multiple external providers can be active simultaneously.
++        # Use the "providers" list below for multi-provider setups.
+         "provider": "",
++        # Multi-provider list (takes precedence over "provider" when non-empty).
++        # Each entry is a provider name string; results are merged across all
++        # active providers at runtime.
++        "providers": [],
+     },
+ 
+     # Subagent delegation — override the provider:model used by delegate_task
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index ca0102d87..8f6073b3c 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -1386,83 +1386,93 @@ def run_doctor(args):
+         check_warn("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)")
+ 
+     # =========================================================================
+-    # Memory Provider (only check the active provider, if any)
++    # Memory Provider(s) — iterate all active providers
+     # =========================================================================
+     print()
+-    print(color("◆ Memory Provider", Colors.CYAN, Colors.BOLD))
++    print(color("◆ Memory Providers", Colors.CYAN, Colors.BOLD))
+ 
+-    _active_memory_provider = ""
++    _active_memory_providers: list[str] = []
+     try:
+         import yaml as _yaml
+         _mem_cfg_path = HERMES_HOME / "config.yaml"
+         if _mem_cfg_path.exists():
+             with open(_mem_cfg_path) as _f:
+                 _raw_cfg = _yaml.safe_load(_f) or {}
+-            _active_memory_provider = (_raw_cfg.get("memory") or {}).get("provider", "")
++            _mem_cfg = _raw_cfg.get("memory") or {}
++            # New list format takes precedence
++            _providers_list = _mem_cfg.get("providers", [])
++            if _providers_list:
++                _active_memory_providers = [p for p in _providers_list if p]
++            else:
++                _single = _mem_cfg.get("provider", "")
++                if _single:
++                    _active_memory_providers = [_single]
+     except Exception:
+         pass
+ 
+-    if not _active_memory_provider:
++    if not _active_memory_providers:
+         check_ok("Built-in memory active", "(no external provider configured — this is fine)")
+-    elif _active_memory_provider == "honcho":
+-        try:
+-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
+-            hcfg = HonchoClientConfig.from_global_config()
+-            _honcho_cfg_path = resolve_config_path()
+-
+-            if not _honcho_cfg_path.exists():
+-                check_warn("Honcho config not found", "run: hermes memory setup")
+-            elif not hcfg.enabled:
+-                check_info(f"Honcho disabled (set enabled: true in {_honcho_cfg_path} to activate)")
+-            elif not (hcfg.api_key or hcfg.base_url):
+-                check_fail("Honcho API key or base URL not set", "run: hermes memory setup")
+-                issues.append("No Honcho API key — run 'hermes memory setup'")
+-            else:
+-                from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
+-                reset_honcho_client()
++    else:
++        for _active_memory_provider in _active_memory_providers:
++            if _active_memory_provider == "honcho":
+                 try:
+-                    get_honcho_client(hcfg)
+-                    check_ok(
+-                        "Honcho connected",
+-                        f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
+-                    )
++                    from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
++                    hcfg = HonchoClientConfig.from_global_config()
++                    _honcho_cfg_path = resolve_config_path()
++
++                    if not _honcho_cfg_path.exists():
++                        check_warn("Honcho config not found", "run: hermes memory setup")
++                    elif not hcfg.enabled:
++                        check_info(f"Honcho disabled (set enabled: true in {_honcho_cfg_path} to activate)")
++                    elif not (hcfg.api_key or hcfg.base_url):
++                        check_fail("Honcho API key or base URL not set", "run: hermes memory setup")
++                        issues.append("No Honcho API key — run 'hermes memory setup'")
++                    else:
++                        from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
++                        reset_honcho_client()
++                        try:
++                            get_honcho_client(hcfg)
++                            check_ok(
++                                "Honcho connected",
++                                f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
++                            )
++                        except Exception as _e:
++                            check_fail("Honcho connection failed", str(_e))
++                            issues.append(f"Honcho unreachable: {_e}")
++                except ImportError:
++                    check_fail("honcho-ai not installed", "pip install honcho-ai")
++                    issues.append("Honcho is set as memory provider but honcho-ai is not installed")
+                 except Exception as _e:
+-                    check_fail("Honcho connection failed", str(_e))
+-                    issues.append(f"Honcho unreachable: {_e}")
+-        except ImportError:
+-            check_fail("honcho-ai not installed", "pip install honcho-ai")
+-            issues.append("Honcho is set as memory provider but honcho-ai is not installed")
+-        except Exception as _e:
+-            check_warn("Honcho check failed", str(_e))
+-    elif _active_memory_provider == "mem0":
+-        try:
+-            from plugins.memory.mem0 import _load_config as _load_mem0_config
+-            mem0_cfg = _load_mem0_config()
+-            mem0_key = mem0_cfg.get("api_key", "")
+-            if mem0_key:
+-                check_ok("Mem0 API key configured")
+-                check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+-            else:
+-                check_fail("Mem0 API key not set", "(set MEM0_API_KEY in .env or run hermes memory setup)")
+-                issues.append("Mem0 is set as memory provider but API key is missing")
+-        except ImportError:
+-            check_fail("Mem0 plugin not loadable", "pip install mem0ai")
+-            issues.append("Mem0 is set as memory provider but mem0ai is not installed")
+-        except Exception as _e:
+-            check_warn("Mem0 check failed", str(_e))
+-    else:
+-        # Generic check for other memory providers (openviking, hindsight, etc.)
+-        try:
+-            from plugins.memory import load_memory_provider
+-            _provider = load_memory_provider(_active_memory_provider)
+-            if _provider and _provider.is_available():
+-                check_ok(f"{_active_memory_provider} provider active")
+-            elif _provider:
+-                check_warn(f"{_active_memory_provider} configured but not available", "run: hermes memory status")
++                    check_warn("Honcho check failed", str(_e))
++            elif _active_memory_provider == "mem0":
++                try:
++                    from plugins.memory.mem0 import _load_config as _load_mem0_config
++                    mem0_cfg = _load_mem0_config()
++                    mem0_key = mem0_cfg.get("api_key", "")
++                    if mem0_key:
++                        check_ok("Mem0 API key configured")
++                        check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
++                    else:
++                        check_fail("Mem0 API key not set", "(set MEM0_API_KEY in .env or run hermes memory setup)")
++                        issues.append("Mem0 is set as memory provider but API key is missing")
++                except ImportError:
++                    check_fail("Mem0 plugin not loadable", "pip install mem0ai")
++                    issues.append("Mem0 is set as memory provider but mem0ai is not installed")
++                except Exception as _e:
++                    check_warn("Mem0 check failed", str(_e))
+             else:
+-                check_warn(f"{_active_memory_provider} plugin not found", "run: hermes memory setup")
+-        except Exception as _e:
+-            check_warn(f"{_active_memory_provider} check failed", str(_e))
++                # Generic check for other memory providers (openviking, hindsight, etc.)
++                try:
++                    from plugins.memory import load_memory_provider
++                    _provider = load_memory_provider(_active_memory_provider)
++                    if _provider and _provider.is_available():
++                        check_ok(f"{_active_memory_provider} provider active")
++                    elif _provider:
++                        check_warn(f"{_active_memory_provider} configured but not available", "run: hermes memory status")
++                    else:
++                        check_warn(f"{_active_memory_provider} plugin not found", "run: hermes memory setup")
++                except Exception as _e:
++                    check_warn(f"{_active_memory_provider} check failed", str(_e))
+ 
+     # =========================================================================
+     # Profiles
+diff --git a/hermes_cli/dump.py b/hermes_cli/dump.py
+index 859f8f624..10dd7a9fb 100644
+--- a/hermes_cli/dump.py
++++ b/hermes_cli/dump.py
+@@ -119,8 +119,11 @@ def _configured_platforms() -> list[str]:
+ 
+ 
+ def _memory_provider(config: dict) -> str:
+-    """Return the active memory provider name."""
++    """Return the active memory provider name(s)."""
+     mem = config.get("memory", {})
++    providers = mem.get("providers", [])
++    if providers:
++        return ", ".join(providers)
+     provider = mem.get("provider", "")
+     return provider if provider else "built-in"
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 70d15d4c0..03dfb27b7 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -9874,8 +9874,9 @@ Examples:
+         description=(
+             "Set up and manage external memory provider plugins.\n\n"
+             "Available providers: honcho, openviking, mem0, hindsight,\n"
+-            "holographic, retaindb, byterover.\n\n"
+-            "Only one external provider can be active at a time.\n"
++            "holographic, retaindb, byterover, mnemosyne.\n\n"
++            "Multiple providers can be active simultaneously.\n"
++            "Results are merged across all active providers.\n"
+             "Built-in memory (MEMORY.md/USER.md) is always active."
+         ),
+     )
+@@ -9884,7 +9885,9 @@ Examples:
+         "setup", help="Interactive provider selection and configuration"
+     )
+     memory_sub.add_parser("status", help="Show current memory provider config")
+-    memory_sub.add_parser("off", help="Disable external provider (built-in only)")
++    memory_sub.add_parser("off", help="Disable all external providers (built-in only)")
++    remove_parser = memory_sub.add_parser("remove", help="Remove a specific memory provider from the active list")
++    remove_parser.add_argument("provider", help="Name of the memory provider to remove")
+     _reset_parser = memory_sub.add_parser(
+         "reset",
+         help="Erase all built-in memory (MEMORY.md and USER.md)",
+@@ -9911,9 +9914,33 @@ Examples:
+             if not isinstance(config.get("memory"), dict):
+                 config["memory"] = {}
+             config["memory"]["provider"] = ""
++            config["memory"]["providers"] = []
+             save_config(config)
+             print("\n  ✓ Memory provider: built-in only")
+             print("  Saved to config.yaml\n")
++        elif sub == "remove":
++            from hermes_cli.plugins_cmd import _remove_memory_provider
++
++            provider_name = getattr(args, "provider", "")
++            if not provider_name:
++                print("\n  Usage: hermes memory remove <provider>\n")
++                return
++            if _remove_memory_provider(provider_name):
++                print(f"\n  ✓ Removed '{provider_name}' from active providers.")
++                from hermes_cli.plugins_cmd import _get_current_memory_provider
++                remaining = _get_current_memory_provider()
++                if remaining:
++                    print(f"  Active providers: {remaining}")
++                else:
++                    print("  Active providers: (none — built-in only)")
++                print("  Start a new session to activate.\n")
++            else:
++                print(f"\n  Provider '{provider_name}' is not in the active providers list.")
++                from hermes_cli.plugins_cmd import _get_current_memory_provider
++                current = _get_current_memory_provider()
++                if current:
++                    print(f"  Active providers: {current}")
++                print()
+         elif sub == "reset":
+             from hermes_constants import get_hermes_home, display_hermes_home
+ 
+diff --git a/hermes_cli/memory_setup.py b/hermes_cli/memory_setup.py
+index 158f80a76..e58716578 100644
+--- a/hermes_cli/memory_setup.py
++++ b/hermes_cli/memory_setup.py
+@@ -34,6 +34,7 @@ def _curses_select(title: str, items: list[tuple[str, str]], default: int = 0) -
+     return curses_radiolist(title, display_items, selected=default, cancel_returns=default)
+ 
+ 
++
+ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str:
+     """Prompt for a value with optional default and secret masking."""
+     suffix = f" [{default}]" if default else ""
+@@ -55,6 +56,31 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
+ # Provider discovery
+ # ---------------------------------------------------------------------------
+ 
++def _get_configured_providers(config: dict) -> list[str]:
++    """Return list of active provider names from config.
++
++    Supports both old format (memory.provider: 'honcho') and
++    new format (memory.providers: ['honcho', 'mem0']).
++    New format takes precedence when non-empty.
++    """
++    mem = config.get("memory", {})
++    providers = mem.get("providers", [])
++    if providers:
++        return [p for p in providers if p]
++    single = mem.get("provider", "")
++    return [single] if single else []
++
++
++def _set_configured_providers(config: dict, provider_names: list[str]) -> None:
++    """Write provider list to config using the new providers list format."""
++    if not isinstance(config.get("memory"), dict):
++        config["memory"] = {}
++    # Write to new list format
++    config["memory"]["providers"] = list(provider_names)
++    # Also set legacy single-provider for backwards compat (first provider)
++    config["memory"]["provider"] = provider_names[0] if provider_names else ""
++
++
+ def _install_dependencies(provider_name: str) -> None:
+     """Install pip dependencies declared in plugin.yaml."""
+     import subprocess
+@@ -209,17 +235,39 @@ def cmd_setup_provider(provider_name: str) -> None:
+     if hasattr(provider, "post_setup"):
+         hermes_home = str(get_hermes_home())
+         provider.post_setup(hermes_home, config)
++        # After post_setup, ask add vs replace, then save
++        active = _get_configured_providers(config)
++        if name not in active:
++            print(f"\n  Currently active: {', '.join(active)}")
++            choice_items = [
++                (f"Add {name} alongside", f"Keep {', '.join(active)} and add {name}"),
++                ("Replace all", f"Use {name} only"),
++            ]
++            choice_idx = _curses_select("  Active providers already configured", choice_items, default=0)
++            if choice_idx == 1:
++                _set_configured_providers(config, [name])
++                active = [name]
++            else:
++                active.append(name)
++                _set_configured_providers(config, active)
++            save_config(config)
++        print(f"\n  Active providers: {', '.join(active)}")
++        print(f"  Start a new session to activate.\n")
+         return
+ 
+-    # Fallback: generic schema-based setup (same as cmd_setup)
+-    config["memory"]["provider"] = name
++    # Generic schema-based setup: append to providers list
++    active = _get_configured_providers(config)
++    if name not in active:
++        active.append(name)
++    _set_configured_providers(config, active)
+     save_config(config)
+     print(f"\n  Memory provider: {name}")
+-    print(f"  Activation saved to config.yaml\n")
++    print(f"  Added to providers list in config.yaml")
++    print(f"  Active providers: {', '.join(active)}\n")
+ 
+ 
+ def cmd_setup(args) -> None:
+-    """Interactive memory provider setup wizard."""
++    """Interactive memory provider setup wizard (multi-provider)."""
+     from hermes_cli.config import load_config, save_config
+ 
+     providers = _get_available_providers()
+@@ -229,22 +277,95 @@ def cmd_setup(args) -> None:
+         print("  Install a plugin to ~/.hermes/plugins/ and try again.\n")
+         return
+ 
+-    # Build picker items
++    config = load_config()
++    if not isinstance(config.get("memory"), dict):
++        config["memory"] = {}
++
++    # Show currently active providers
++    active = _get_configured_providers(config)
++    if active:
++        print(f"\n  Currently active: {', '.join(active)}")
++        print(f"  You can add more providers or change your selection.\n")
++
++    # Build picker items (all available providers)
+     items = []
++    provider_names = []
++
++    # Add "Remove a provider..." option when providers are active
++    remove_idx = -1
++    if active:
++        items.append(("Remove a provider...", "— deactivate an active provider"))
++        remove_idx = 0
++
+     for name, desc, _ in providers:
+         items.append((name, f"— {desc}"))
++        provider_names.append(name)
+     items.append(("Built-in only", "— MEMORY.md / USER.md (default)"))
+ 
++    # Pre-select currently active providers
++    pre_selected = set()
++    for i, name in enumerate(provider_names):
++        if name in active:
++            pre_selected.add(i)
++
+     builtin_idx = len(items) - 1
+-    selected = _curses_select("Memory provider setup", items, default=builtin_idx)
+ 
+-    config = load_config()
+-    if not isinstance(config.get("memory"), dict):
+-        config["memory"] = {}
++    # If no current selection, default to built-in only
++    if not pre_selected:
++        pre_selected = {builtin_idx}
++
++    if remove_idx >= 0:
++        # Default to first active provider if any, otherwise 0 (the remove entry)
++        if pre_selected:
++            default_idx = min(pre_selected) + 1  # +1 for the remove entry offset
++        else:
++            default_idx = 0
++        selected = _curses_select("Memory provider setup", items, default=default_idx)
++    else:
++        selected = _curses_select("Memory provider setup", items, default=pre_selected.pop() if len(pre_selected) == 1 else 0)
++
++    # Handle "Remove a provider..." selection
++    if selected == remove_idx and remove_idx >= 0:
++        from hermes_cli.curses_ui import curses_checklist
++        from hermes_cli.plugins_cmd import _remove_memory_provider
++
++        remove_items = list(active)
++        if not remove_items:
++            print("\n  No active providers to remove.\n")
++            return
++
++        # All are pre-selected; user unchecks the ones to remove
++        remove_selected = curses_checklist(
++            title="Providers to KEEP (uncheck to remove)",
++            items=remove_items,
++            selected=set(range(len(remove_items))),
++        )
++
++        to_remove = [remove_items[i] for i in range(len(remove_items)) if i not in remove_selected]
++        if not to_remove:
++            print("\n  No changes made.\n")
++            return
++
++        for prov in to_remove:
++            _remove_memory_provider(prov)
++
++        remaining = _get_configured_providers(config)
++        if remaining:
++            print(f"\n  ✓ Removed: {', '.join(to_remove)}")
++            print(f"  Active providers: {', '.join(remaining)}")
++        else:
++            print(f"\n  ✓ Removed: {', '.join(to_remove)}")
++            print("  Active providers: (none — built-in only)")
++        print("  Start a new session to activate.\n")
++        return
++
++    # Adjust for the "Remove" entry offset
++    if remove_idx >= 0:
++        selected -= 1  # shift back since we prepended one entry
+ 
+     # Built-in only
+     if selected >= len(providers) or selected < 0:
+-        config["memory"]["provider"] = ""
++        _set_configured_providers(config, [])
+         save_config(config)
+         print("\n  ✓ Memory provider: built-in only")
+         print("  Saved to config.yaml\n")
+@@ -252,14 +373,37 @@ def cmd_setup(args) -> None:
+ 
+     name, _, provider = providers[selected]
+ 
++    # If there are already active providers not including this one,
++    # ask whether to add alongside or replace entirely.
++    replace_existing = False
++    if active and name not in active:
++        print(f"\n  Currently active: {', '.join(active)}")
++        choice_items = [
++            (f"Add {name} alongside", f"Keep {', '.join(active)} and add {name}"),
++            ("Replace all", f"Use {name} only"),
++        ]
++        choice_idx = _curses_select("  Active providers already configured", choice_items, default=0)
++        replace_existing = (choice_idx == 1)
++
+     # Install pip dependencies if declared in plugin.yaml
+     _install_dependencies(name)
+ 
+     # If the provider has a post_setup hook, delegate entirely to it.
+-    # The hook handles its own config, connection test, and activation.
+     if hasattr(provider, "post_setup"):
+         hermes_home = str(get_hermes_home())
+         provider.post_setup(hermes_home, config)
++        # After post_setup, add to providers list (or replace)
++        if replace_existing:
++            _set_configured_providers(config, [name])
++            active = [name]
++        else:
++            active = _get_configured_providers(config)
++            if name not in active:
++                active.append(name)
++            _set_configured_providers(config, active)
++        save_config(config)
++        print(f"\n  Active providers: {', '.join(active)}")
++        print(f"\n  Start a new session to activate.\n")
+         return
+ 
+     schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
+@@ -330,8 +474,15 @@ def cmd_setup(args) -> None:
+                     if env_var and env_var not in env_writes:
+                         env_writes[env_var] = val
+ 
+-    # Write activation key to config.yaml
+-    config["memory"]["provider"] = name
++    # Add to providers list (add alongside or replace based on user choice)
++    if replace_existing:
++        _set_configured_providers(config, [name])
++        active = [name]
++    else:
++        active = _get_configured_providers(config)
++        if name not in active:
++            active.append(name)
++        _set_configured_providers(config, active)
+     save_config(config)
+ 
+     # Write non-secret config to provider's native location
+@@ -347,11 +498,13 @@ def cmd_setup(args) -> None:
+         _write_env_vars(env_path, env_writes)
+ 
+     print(f"\n  Memory provider: {name}")
+-    print(f"  Activation saved to config.yaml")
++    print(f"  Active providers: {', '.join(active)}")
++    print(f"  Saved to config.yaml")
+     if provider_config:
+         print(f"  Provider config saved")
+     if env_writes:
+         print(f"  API keys saved to .env")
++
+     print(f"\n  Start a new session to activate.\n")
+ 
+ 
+@@ -390,54 +543,58 @@ def cmd_status(args) -> None:
+ 
+     config = load_config()
+     mem_config = config.get("memory", {})
+-    provider_name = mem_config.get("provider", "")
++    active = _get_configured_providers(config)
+ 
+     print(f"\nMemory status\n" + "─" * 40)
+-    print(f"  Built-in:  always active")
+-    print(f"  Provider:  {provider_name or '(none — built-in only)'}")
+-
+-    if provider_name:
+-        provider_config = mem_config.get(provider_name, {})
+-        if provider_config:
+-            print(f"\n  {provider_name} config:")
+-            for key, val in provider_config.items():
+-                print(f"    {key}: {val}")
+-
+-        providers = _get_available_providers()
+-        found = any(name == provider_name for name, _, _ in providers)
+-        if found:
+-            print(f"\n  Plugin:    installed ✓")
+-            for pname, _, p in providers:
+-                if pname == provider_name:
+-                    if p.is_available():
+-                        print(f"  Status:    available ✓")
+-                    else:
+-                        print(f"  Status:    not available ✗")
+-                        schema = p.get_config_schema() if hasattr(p, "get_config_schema") else []
+-                        # Check all fields that have env_var (both secret and non-secret)
+-                        required_fields = [f for f in schema if f.get("env_var")]
+-                        if required_fields:
+-                            print(f"  Missing:")
+-                            for f in required_fields:
+-                                env_var = f.get("env_var", "")
+-                                url = f.get("url", "")
+-                                is_set = bool(os.environ.get(env_var))
+-                                mark = "✓" if is_set else "✗"
+-                                line = f"    {mark} {env_var}"
+-                                if url and not is_set:
+-                                    line += f"  → {url}"
+-                                print(line)
+-                    break
+-        else:
+-            print(f"\n  Plugin:    NOT installed ✗")
+-            print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
++    print(f"  Built-in:   always active")
++    if active:
++        print(f"  Providers:  {', '.join(active)}")
++    else:
++        print(f"  Providers:  (none — built-in only)")
++
++    if active:
++        for provider_name in active:
++            print(f"\n  ── {provider_name} ──")
++            provider_config = mem_config.get(provider_name, {})
++            if provider_config:
++                print(f"  Config:")
++                for key, val in provider_config.items():
++                    print(f"    {key}: {val}")
++
++            providers = _get_available_providers()
++            found = any(name == provider_name for name, _, _ in providers)
++            if found:
++                print(f"  Plugin:     installed ✓")
++                for pname, _, p in providers:
++                    if pname == provider_name:
++                        if p.is_available():
++                            print(f"  Status:     available ✓")
++                        else:
++                            print(f"  Status:     not available ✗")
++                            schema = p.get_config_schema() if hasattr(p, "get_config_schema") else []
++                            required_fields = [f for f in schema if f.get("env_var")]
++                            if required_fields:
++                                print(f"  Missing:")
++                                for f in required_fields:
++                                    env_var = f.get("env_var", "")
++                                    url = f.get("url", "")
++                                    is_set = bool(os.environ.get(env_var))
++                                    mark = "✓" if is_set else "✗"
++                                    line = f"    {mark} {env_var}"
++                                    if url and not is_set:
++                                        line += f"  → {url}"
++                                    print(line)
++                        break
++            else:
++                print(f"  Plugin:     NOT installed ✗")
++                print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
+ 
+     providers = _get_available_providers()
+     if providers:
+         print(f"\n  Installed plugins:")
+         for pname, desc, _ in providers:
+-            active = " ← active" if pname == provider_name else ""
+-            print(f"    • {pname}  ({desc}){active}")
++            active_marker = " ← active" if pname in active else ""
++            print(f"    • {pname}  ({desc}){active_marker}")
+ 
+     print()
+ 
+diff --git a/hermes_cli/plugins_cmd.py b/hermes_cli/plugins_cmd.py
+index a13e1b212..479feacb2 100644
+--- a/hermes_cli/plugins_cmd.py
++++ b/hermes_cli/plugins_cmd.py
+@@ -783,10 +783,16 @@ def _discover_context_engines() -> list[tuple[str, str]]:
+ 
+ 
+ def _get_current_memory_provider() -> str:
+-    """Return the current memory.provider from config (empty = built-in)."""
++    """Return the current memory.provider(s) from config (empty = built-in)."""
+     try:
+         from hermes_cli.config import load_config
+         config = load_config()
++        mem = config.get("memory", {})
++        providers = mem.get("providers", [])
++        if providers:
++            active = [p for p in providers if p]
++            if active:
++                return ", ".join(active)
+         return cfg_get(config, "memory", "provider", default="") or ""
+     except Exception:
+         return ""
+@@ -803,15 +809,40 @@ def _get_current_context_engine() -> str:
+ 
+ 
+ def _save_memory_provider(name: str) -> None:
+-    """Persist memory.provider to config.yaml."""
++    """Persist memory.provider to config.yaml (appends to providers list)."""
+     from hermes_cli.config import load_config, save_config
+     config = load_config()
+     if "memory" not in config:
+         config["memory"] = {}
+-    config["memory"]["provider"] = name
++    # Read current providers, append if new name isn't there
++    existing = config["memory"].get("providers", [])
++    if name and name not in existing:
++        existing.append(name)
++    config["memory"]["providers"] = existing if name else []
++    # Also set legacy single-provider for backwards compat
++    config["memory"]["provider"] = existing[0] if existing else ""
+     save_config(config)
+ 
+ 
++def _remove_memory_provider(name: str) -> bool:
++    """Remove a provider from the active providers list.
++
++    Returns True if the provider was found and removed, False otherwise.
++    """
++    from hermes_cli.config import load_config, save_config
++    config = load_config()
++    if "memory" not in config:
++        return False
++    providers = config["memory"].get("providers", [])
++    if name not in providers:
++        return False
++    providers.remove(name)
++    config["memory"]["providers"] = providers
++    config["memory"]["provider"] = providers[0] if providers else ""
++    save_config(config)
++    return True
++
++
+ def _save_context_engine(name: str) -> None:
+     """Persist context.engine to config.yaml."""
+     from hermes_cli.config import load_config, save_config
+@@ -823,39 +854,60 @@ def _save_context_engine(name: str) -> None:
+ 
+ 
+ def _configure_memory_provider() -> bool:
+-    """Launch a radio picker for memory providers. Returns True if changed."""
+-    from hermes_cli.curses_ui import curses_radiolist
++    """Launch a checklist picker for memory providers. Returns True if changed."""
++    from hermes_cli.curses_ui import curses_checklist
++    from hermes_cli.config import load_config, save_config
++
++    config = load_config()
++    current_active = set()
++    mem = config.get("memory", {})
++    providers_list = mem.get("providers", [])
++    if providers_list:
++        current_active = {p for p in providers_list if p}
++    elif mem.get("provider", ""):
++        current_active = {mem["provider"]}
+ 
+-    current = _get_current_memory_provider()
+     providers = _discover_memory_providers()
+ 
+-    # Build items: "built-in" first, then discovered providers
+-    items = ["built-in (default)"]
+-    names = [""]  # empty string = built-in
+-    selected = 0
++    # Build checklist items: discovered providers + "built-in only" sentinel
++    items = []
++    names = []
++    pre_selected = set()
+ 
+-    for name, desc in providers:
+-        names.append(name)
++    for i, (name, desc) in enumerate(providers):
+         label = f"{name} \u2014 {desc}" if desc else name
+         items.append(label)
+-        if name == current:
+-            selected = len(items) - 1
++        names.append(name)
++        if name in current_active:
++            pre_selected.add(i)
+ 
+-    # If current provider isn't in discovered list, add it
+-    if current and current not in names:
+-        names.append(current)
+-        items.append(f"{current} (not found)")
+-        selected = len(items) - 1
++    # Add built-in sentinel at end
++    builtin_idx = len(items)
++    items.append("built-in only (disable all external providers)")
++    names.append("")
+ 
+-    choice = curses_radiolist(
+-        title="Memory Provider (select one)",
++    # If nothing external is active, pre-select built-in
++    if not pre_selected:
++        pre_selected.add(builtin_idx)
++
++    selected_indices = curses_checklist(
++        title="Memory Providers (SPACE to toggle, ENTER to confirm)",
+         items=items,
+-        selected=selected,
++        selected=pre_selected,
+     )
+ 
+-    new_provider = names[choice]
+-    if new_provider != current:
+-        _save_memory_provider(new_provider)
++    # If built-in only is selected (or nothing), clear all
++    if builtin_idx in selected_indices or not selected_indices:
++        new_active = []
++    else:
++        new_active = [names[i] for i in sorted(selected_indices) if i < len(names) and names[i]]
++
++    # Compare with current and save if changed
++    old_active = sorted(current_active)
++    if sorted(new_active) != old_active:
++        from hermes_cli.memory_setup import _set_configured_providers
++        _set_configured_providers(config, new_active)
++        save_config(config)
+         return True
+     return False
+ 
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 46786455c..eb5600429 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -3956,6 +3956,7 @@ def _merged_plugins_hub() -> Dict[str, Any]:
+         "orphan_dashboard_plugins": orphan_dashboard,
+         "providers": {
+             "memory_provider": _get_current_memory_provider() or "",
++            "memory_providers_list": [p.strip() for p in (_get_current_memory_provider() or "").split(",") if p.strip()],
+             "memory_options": memory_providers,
+             "context_engine": _get_current_context_engine(),
+             "context_options": context_engines,
+@@ -4054,6 +4055,7 @@ async def delete_agent_plugin(request: Request, name: str):
+ 
+ class _PluginProvidersPutBody(BaseModel):
+     memory_provider: Optional[str] = None
++    memory_providers: Optional[list] = None
+     context_engine: Optional[str] = None
+ 
+ 
+@@ -4068,11 +4070,27 @@ async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody):
+ 
+     if body.memory_provider is not None:
+         _save_memory_provider(body.memory_provider)
++    if body.memory_providers is not None:
++        from hermes_cli.memory_setup import _set_configured_providers
++        config = load_config()
++        _set_configured_providers(config, body.memory_providers)
++        save_config(config)
+     if body.context_engine is not None:
+         _save_context_engine(body.context_engine)
+     return {"ok": True}
+ 
+ 
++@app.delete("/api/dashboard/plugin-providers/{name}")
++async def delete_memory_provider(request: Request, name: str):
++    """Remove a specific memory provider from the active list."""
++    _require_token(request)
++    _validate_plugin_name(name)
++    from hermes_cli.plugins_cmd import _remove_memory_provider
++
++    removed = _remove_memory_provider(name)
++    return {"ok": True, "removed": removed}
++
++
+ class _PluginVisibilityBody(BaseModel):
+     hidden: bool
+ 
+diff --git a/plugins/memory/__init__.py b/plugins/memory/__init__.py
+index 0d714f64d..c74df1764 100644
+--- a/plugins/memory/__init__.py
++++ b/plugins/memory/__init__.py
+@@ -9,8 +9,9 @@ Each subdirectory must contain ``__init__.py`` with a class implementing
+ the MemoryProvider ABC.  On name collisions, bundled providers take
+ precedence.
+ 
+-Only ONE provider can be active at a time, selected via
+-``memory.provider`` in config.yaml.
++Multiple providers can be active simultaneously, configured via
++``memory.providers`` list (or legacy ``memory.provider`` string)
++in config.yaml.  Results are merged across all active providers.
+ 
+ Usage:
+     from plugins.memory import discover_memory_providers, load_memory_provider
+@@ -27,7 +28,6 @@ import logging
+ import sys
+ from pathlib import Path
+ from typing import List, Optional, Tuple
+-from hermes_cli.config import cfg_get
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -305,31 +305,40 @@ class _ProviderCollector:
+         pass  # CLI registration happens via discover_plugin_cli_commands()
+ 
+ 
+-def _get_active_memory_provider() -> Optional[str]:
+-    """Read the active memory provider name from config.yaml.
++def get_active_memory_providers() -> list:
++    """Return list of active memory provider names from config.
+ 
+-    Returns the provider name (e.g. ``"honcho"``) or None if no
+-    external provider is configured.  Lightweight — only reads config,
+-    no plugin loading.
++    Supports both old format (memory.provider: 'honcho') and
++    new format (memory.providers: ['honcho', 'mem0']).
++    New format takes precedence when non-empty.
+     """
+     try:
+         from hermes_cli.config import load_config
+         config = load_config()
+-        return cfg_get(config, "memory", "provider") or None
++        memory_config = config.get('memory', {})
++
++        # New list format takes precedence
++        providers = memory_config.get('providers', [])
++        if providers:
++            return [p for p in providers if p]
++
++        # Fall back to legacy single-string format
++        single = memory_config.get('provider', '')
++        return [single] if single else []
+     except Exception:
+-        return None
++        return []
+ 
+ 
+ def discover_plugin_cli_commands() -> List[dict]:
+-    """Return CLI commands for the **active** memory plugin only.
++    """Return CLI commands for **active** memory plugins.
+ 
+-    Only one memory provider can be active at a time (set via
+-    ``memory.provider`` in config.yaml).  This function reads that
+-    value and only loads CLI registration for the matching plugin.
++    Multiple memory providers can be active simultaneously (set via
++    ``memory.providers`` list in config.yaml).  This function reads that
++    list and loads CLI registration for all matching plugins.
+     If no provider is active, no commands are registered.
+ 
+-    Looks for a ``register_cli(subparser)`` function in the active
+-    plugin's ``cli.py``.  Returns a list of at most one dict with
++    Looks for a ``register_cli(subparser)`` function in each active
++    provider's ``cli.py``.  Returns a list of dicts with
+     keys: ``name``, ``help``, ``description``, ``setup_fn``,
+     ``handler_fn``.
+ 
+@@ -341,67 +350,67 @@ def discover_plugin_cli_commands() -> List[dict]:
+     if not _MEMORY_PLUGINS_DIR.is_dir():
+         return results
+ 
+-    active_provider = _get_active_memory_provider()
+-    if not active_provider:
++    active_providers = get_active_memory_providers()
++    if not active_providers:
+         return results
+ 
+-    # Only look at the active provider's directory
+-    plugin_dir = find_provider_dir(active_provider)
+-    if not plugin_dir:
+-        return results
++    for active_provider in active_providers:
++        # Look at each active provider's directory
++        plugin_dir = find_provider_dir(active_provider)
++        if not plugin_dir:
++            continue
+ 
+-    cli_file = plugin_dir / "cli.py"
+-    if not cli_file.exists():
+-        return results
++        cli_file = plugin_dir / "cli.py"
++        if not cli_file.exists():
++            continue
+ 
+-    _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
+-    module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"_hermes_user_memory.{active_provider}.cli"
+-    try:
+-        # Import the CLI module (lightweight — no SDK needed)
+-        if module_name in sys.modules:
+-            cli_mod = sys.modules[module_name]
+-        else:
+-            spec = importlib.util.spec_from_file_location(
+-                module_name, str(cli_file)
+-            )
+-            if not spec or not spec.loader:
+-                return results
+-            cli_mod = importlib.util.module_from_spec(spec)
+-            sys.modules[module_name] = cli_mod
+-            spec.loader.exec_module(cli_mod)
+-
+-        register_cli = getattr(cli_mod, "register_cli", None)
+-        if not callable(register_cli):
+-            return results
+-
+-        # Read metadata from plugin.yaml if available
+-        help_text = f"Manage {active_provider} memory plugin"
+-        description = ""
+-        yaml_file = plugin_dir / "plugin.yaml"
+-        if yaml_file.exists():
+-            try:
+-                import yaml
+-                with open(yaml_file) as f:
+-                    meta = yaml.safe_load(f) or {}
+-                desc = meta.get("description", "")
+-                if desc:
+-                    help_text = desc
+-                    description = desc
+-            except Exception:
+-                pass
++        _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
++        module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"_hermes_user_memory.{active_provider}.cli"
++        try:
++            # Import the CLI module (lightweight — no SDK needed)
++            if module_name in sys.modules:
++                cli_mod = sys.modules[module_name]
++            else:
++                spec = importlib.util.spec_from_file_location(
++                    module_name, str(cli_file)
++                )
++                if not spec or not spec.loader:
++                    continue
++                cli_mod = importlib.util.module_from_spec(spec)
++                sys.modules[module_name] = cli_mod
++                spec.loader.exec_module(cli_mod)
++
++            register_cli = getattr(cli_mod, "register_cli", None)
++            if not callable(register_cli):
++                continue
+ 
+-        handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
+-                     getattr(cli_mod, "honcho_command", None)
+-
+-        results.append({
+-            "name": active_provider,
+-            "help": help_text,
+-            "description": description,
+-            "setup_fn": register_cli,
+-            "handler_fn": handler_fn,
+-            "plugin": active_provider,
+-        })
+-    except Exception as e:
+-        logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
++            # Read metadata from plugin.yaml if available
++            help_text = f"Manage {active_provider} memory plugin"
++            description = ""
++            yaml_file = plugin_dir / "plugin.yaml"
++            if yaml_file.exists():
++                try:
++                    import yaml
++                    with open(yaml_file) as f:
++                        meta = yaml.safe_load(f) or {}
++                    desc = meta.get("description", "")
++                    if desc:
++                        help_text = desc
++                        description = desc
++                except Exception:
++                    pass
++
++            handler_fn = getattr(cli_mod, f"{active_provider}_command", None)
++
++            results.append({
++                "name": active_provider,
++                "help": help_text,
++                "description": description,
++                "setup_fn": register_cli,
++                "handler_fn": handler_fn,
++                "plugin": active_provider,
++            })
++        except Exception as e:
++            logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
+ 
+     return results
+diff --git a/plugins/memory/holographic/__init__.py b/plugins/memory/holographic/__init__.py
+index dc9ee530c..409c976d8 100644
+--- a/plugins/memory/holographic/__init__.py
++++ b/plugins/memory/holographic/__init__.py
+@@ -36,11 +36,11 @@ logger = logging.getLogger(__name__)
+ # ---------------------------------------------------------------------------
+ 
+ FACT_STORE_SCHEMA = {
+-    "name": "fact_store",
++    "name": "holographic_store",
+     "description": (
+         "Deep structured memory with algebraic reasoning. "
+         "Use alongside the memory tool — memory for always-on context, "
+-        "fact_store for deep recall and compositional queries.\n\n"
++        "holographic_store for deep recall and compositional queries.\n\n"
+         "ACTIONS (simple → powerful):\n"
+         "• add — Store a fact the user would expect you to remember.\n"
+         "• search — Keyword lookup ('editor config', 'deploy process').\n"
+@@ -74,7 +74,7 @@ FACT_STORE_SCHEMA = {
+ }
+ 
+ FACT_FEEDBACK_SCHEMA = {
+-    "name": "fact_feedback",
++    "name": "holographic_feedback",
+     "description": (
+         "Rate a fact after using it. Mark 'helpful' if accurate, 'unhelpful' if outdated. "
+         "This trains the memory — good facts rise, bad facts sink."
+@@ -193,14 +193,14 @@ class HolographicMemoryProvider(MemoryProvider):
+             return (
+                 "# Holographic Memory\n"
+                 "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
+-                "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
+-                "Use fact_feedback to rate facts after using them (trains trust scores)."
++                "Use holographic_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
++                "Use holographic_feedback to rate facts after using them (trains trust scores)."
+             )
+         return (
+             f"# Holographic Memory\n"
+             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
+-            f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
+-            f"Use fact_feedback to rate facts after using them (trains trust scores)."
++            f"Use holographic_store to search, probe entities, reason across entities, or add facts.\n"
++            f"Use holographic_feedback to rate facts after using them (trains trust scores)."
+         )
+ 
+     def prefetch(self, query: str, *, session_id: str = "") -> str:
+@@ -228,9 +228,15 @@ class HolographicMemoryProvider(MemoryProvider):
+         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
+ 
+     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+-        if tool_name == "fact_store":
++        # Backward-compat: resolve legacy fact_* names to holographic_*
++        _TOOL_ALIASES = {
++            "fact_store": "holographic_store",
++            "fact_feedback": "holographic_feedback",
++        }
++        tool_name = _TOOL_ALIASES.get(tool_name, tool_name)
++        if tool_name == "holographic_store":
+             return self._handle_fact_store(args)
+-        elif tool_name == "fact_feedback":
++        elif tool_name == "holographic_feedback":
+             return self._handle_fact_feedback(args)
+         return tool_error(f"Unknown tool: {tool_name}")
+ 
+diff --git a/plugins/memory/honcho/cli.py b/plugins/memory/honcho/cli.py
+index 402389ab9..48c37f76d 100644
+--- a/plugins/memory/honcho/cli.py
++++ b/plugins/memory/honcho/cli.py
+@@ -544,6 +544,9 @@ def cmd_setup(args) -> None:
+         from hermes_cli.config import load_config, save_config
+         hermes_config = load_config()
+         hermes_config.setdefault("memory", {})["provider"] = "honcho"
++        providers = hermes_config["memory"].setdefault("providers", [])
++        if "honcho" not in providers:
++            providers.append("honcho")
+         save_config(hermes_config)
+         print("  Memory provider set to 'honcho' in config.yaml")
+     except Exception as e:
+diff --git a/run_agent.py b/run_agent.py
+index 403dba4e7..0c8052d95 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1754,20 +1754,34 @@ class AIAgent:
+         
+ 
+ 
+-        # Memory provider plugin (external — one at a time, alongside built-in)
+-        # Reads memory.provider from config to select which plugin to activate.
++        # Memory provider plugins (external — one or more, alongside built-in)
++        # Reads memory.providers (list) or memory.provider (legacy single string)
++        # from config to select which plugins to activate.
+         self._memory_manager = None
+         if not skip_memory:
+             try:
+-                _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
++                from agent.memory_manager import MemoryManager as _MemoryManager
++                from plugins.memory import (
++                    get_active_memory_providers as _get_providers,
++                    load_memory_provider as _load_mem,
++                )
++                _active_providers = _get_providers()
+ 
+-                if _mem_provider_name:
+-                    from agent.memory_manager import MemoryManager as _MemoryManager
+-                    from plugins.memory import load_memory_provider as _load_mem
++                if _active_providers:
+                     self._memory_manager = _MemoryManager()
+-                    _mp = _load_mem(_mem_provider_name)
+-                    if _mp and _mp.is_available():
+-                        self._memory_manager.add_provider(_mp)
++                    for _provider_name in _active_providers:
++                        try:
++                            _mp = _load_mem(_provider_name)
++                            if _mp and _mp.is_available():
++                                self._memory_manager.add_provider(_mp)
++                                logger.info("Memory provider '%s' loaded", _provider_name)
++                            elif _mp:
++                                logger.info("Memory provider '%s' loaded but not available.", _provider_name)
++                            else:
++                                logger.warning("Memory provider '%s' not found.", _provider_name)
++                        except Exception as _mpe:
++                            logger.warning("Failed to load memory provider '%s': %s", _provider_name, _mpe)
++
+                     if self._memory_manager.providers:
+                         _init_kwargs = {
+                             "session_id": self.session_id,
+@@ -1809,9 +1823,8 @@ class AIAgent:
+                         except Exception:
+                             pass
+                         self._memory_manager.initialize_all(**_init_kwargs)
+-                        logger.info("Memory provider '%s' activated", _mem_provider_name)
+                     else:
+-                        logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
++                        logger.debug("No memory providers available")
+                         self._memory_manager = None
+             except Exception as _mpe:
+                 logger.warning("Memory provider plugin init failed: %s", _mpe)
+@@ -9433,14 +9446,15 @@ class AIAgent:
+         )
+ 
+         # Notify external memory provider before compression discards context
++        memory_context = ""
+         if self._memory_manager:
+             try:
+-                self._memory_manager.on_pre_compress(messages)
++                memory_context = self._memory_manager.on_pre_compress(messages) or ""
+             except Exception:
+-                pass
++                memory_context = ""
+ 
+         try:
+-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
++            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, memory_context=memory_context)
+         except TypeError:
+             # Plugin context engine with strict signature that doesn't accept
+             # focus_topic — fall back to calling without it.
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index 73480ada9..4f032c457 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -216,6 +216,24 @@ try:
+         _MCP_SAMPLING_TYPES = True
+     except ImportError:
+         logger.debug("MCP sampling types not available -- sampling disabled")
++        # Provide fallback compat types for tests and downstream consumers
++        # when the MCP SDK is too old to export these names.
++        class _CompatType:
++            def __init__(self, **kwargs):
++                for k, v in kwargs.items():
++                    setattr(self, k, v)
++        class _ErrorDataType(Exception):
++            def __init__(self, code=None, message="", **kwargs):
++                self.code = code
++                self.message = message
++                super().__init__(message)
++        CreateMessageResult = _CompatType
++        CreateMessageResultWithTools = _CompatType
++        ErrorData = _ErrorDataType
++        SamplingCapability = _CompatType
++        SamplingToolsCapability = _CompatType
++        TextContent = _CompatType
++        ToolUseContent = _CompatType
+     # Notification types for dynamic tool discovery (tools/list_changed)
+     try:
+         from mcp.types import (
+@@ -229,6 +247,24 @@ try:
+         logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
+ except ImportError:
+     logger.debug("mcp package not installed -- MCP tool support disabled")
++    # Provide fallback compat types for tests and downstream consumers
++    # when the MCP SDK is not installed at all.
++    class _CompatType:
++        def __init__(self, **kwargs):
++            for k, v in kwargs.items():
++                setattr(self, k, v)
++    class _ErrorDataType(Exception):
++        def __init__(self, code=None, message="", **kwargs):
++            self.code = code
++            self.message = message
++            super().__init__(message)
++    CreateMessageResult = _CompatType
++    CreateMessageResultWithTools = _CompatType
++    ErrorData = _ErrorDataType
++    SamplingCapability = _CompatType
++    SamplingToolsCapability = _CompatType
++    TextContent = _CompatType
++    ToolUseContent = _CompatType
+ 
+ 
+ def _check_message_handler_support() -> bool:

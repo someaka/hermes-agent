@@ -258,6 +258,7 @@ class MemoryManager:
     def __init__(self) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
+        self._has_external: bool = False  # True once a non-builtin provider is added
         self._lock = threading.RLock()
 
     # -- Registration --------------------------------------------------------
@@ -268,6 +269,8 @@ class MemoryManager:
         Built-in provider (name ``"builtin"``) is always accepted.
         Multiple external providers are allowed, but duplicate names are
         rejected with a warning.
+
+        Thread-safe: protected by ``self._lock``.
         """
         with self._lock:
             is_builtin = provider.name == "builtin"
@@ -291,6 +294,9 @@ class MemoryManager:
                     provider.name, exc,
                 )
                 return
+
+            if not is_builtin:
+                self._has_external = True
 
             self._providers.append(provider)
 
@@ -327,7 +333,8 @@ class MemoryManager:
     @property
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
-        return list(self._providers)
+        with self._lock:
+            return list(self._providers)
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""

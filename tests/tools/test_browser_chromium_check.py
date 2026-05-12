@@ -14,6 +14,12 @@ import pytest
 from tools import browser_tool as bt
 
 
+def _fail_popen(*args, **kwargs):
+    """Belt-and-suspenders: if code tries to spawn browser when Chromium
+    is missing, fail the test immediately instead of hanging."""
+    raise RuntimeError("subprocess.Popen should not be called — Chromium is missing")
+
+
 @pytest.fixture(autouse=True)
 def _reset_chromium_cache():
     bt._cached_chromium_installed = None
@@ -51,10 +57,6 @@ class TestChromiumInstalled:
         (tmp_path / "chromium_headless_shell-1208").mkdir()
         assert bt._chromium_installed() is True
 
-<<<<<<< Updated upstream
-
-
-=======
     def test_false_when_dir_empty(self, monkeypatch, tmp_path):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path / "fakehome"))
@@ -77,7 +79,6 @@ class TestChromiumInstalled:
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path / "fakehome"))
         monkeypatch.setattr("shutil.which", lambda _cmd: None)
         assert bt._chromium_installed() is False
->>>>>>> Stashed changes
 
     def test_result_cached(self, monkeypatch, tmp_path):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
@@ -89,8 +90,6 @@ class TestChromiumInstalled:
 
 
 class TestCheckBrowserRequirementsChromium:
-<<<<<<< Updated upstream
-=======
     def test_local_mode_missing_chromium_returns_false(self, monkeypatch, tmp_path):
         monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/local/bin/agent-browser")
@@ -101,7 +100,6 @@ class TestCheckBrowserRequirementsChromium:
         monkeypatch.setattr("shutil.which", lambda _cmd: None)
 
         assert bt.check_browser_requirements() is False
->>>>>>> Stashed changes
 
     def test_local_mode_with_chromium_returns_true(self, monkeypatch, tmp_path):
         monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
@@ -145,8 +143,6 @@ class TestRunBrowserCommandChromiumGuard:
     Chromium is missing in local mode.
     """
 
-<<<<<<< Updated upstream
-=======
     def test_local_mode_missing_chromium_returns_error_immediately(self, monkeypatch, tmp_path):
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/local/bin/agent-browser")
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
@@ -154,11 +150,8 @@ class TestRunBrowserCommandChromiumGuard:
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path / "fakehome"))
         monkeypatch.setattr("shutil.which", lambda _cmd: None)
->>>>>>> Stashed changes
 
 
-<<<<<<< Updated upstream
-=======
         monkeypatch.setattr("subprocess.Popen", _fail_popen)
 
         result = bt._run_browser_command("task-1", "navigate", ["https://example.com"])
@@ -190,4 +183,3 @@ class TestRunBrowserCommandChromiumGuard:
         result = bt._run_browser_command("task-1", "navigate", ["https://example.com"])
         assert result["success"] is False
         assert "agent-browser install" in result["error"]
->>>>>>> Stashed changes

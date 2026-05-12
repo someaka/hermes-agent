@@ -106,8 +106,6 @@ class TestCredentialPoolSeedsFromDotEnv:
         assert active_sources == set()
         assert entries == []
 
-<<<<<<< Updated upstream
-=======
     def test_dotenv_wins_over_os_environ(self, isolated_hermes_home, monkeypatch):
         """_seed_from_env prefers ~/.hermes/.env over os.environ."""
         _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="dotenv-val")
@@ -122,7 +120,6 @@ class TestCredentialPoolSeedsFromDotEnv:
         assert len(seeded) == 1
         # _seed_from_env uses load_env() which prefers .env over os.environ
         assert seeded[0].access_token == "dotenv-val"
->>>>>>> Stashed changes
 
 
 class TestAuthResolvesFromDotEnv:

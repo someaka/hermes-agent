@@ -4088,3 +4088,209 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
         assert task.status == "ready"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI Kanban Notification Bridge tests (Elements 1-5 from PLAN-notification-fix)
+# ---------------------------------------------------------------------------
+
+def test_format_kanban_notification_completed_with_summary():
+    """Element 2: _format_kanban_notification formats completed events."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="completed",
+                  payload={"summary": "shipped rate limiter"}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    msg = _format_kanban_notification(ev, sub)
+    assert msg.startswith("[IMPORTANT: Kanban task t_abc done")
+    assert "shipped rate limiter" in msg
+
+
+def test_format_kanban_notification_completed_without_summary():
+    """Element 2: completed event with empty payload still produces message."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="completed", payload={}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    msg = _format_kanban_notification(ev, sub)
+    assert msg == "[IMPORTANT: Kanban task t_abc done]"
+
+
+def test_format_kanban_notification_blocked_with_reason():
+    """Element 2: blocked event includes reason if present."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="blocked",
+                  payload={"reason": "needs API key"}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    msg = _format_kanban_notification(ev, sub)
+    assert "blocked: needs API key" in msg
+
+
+def test_format_kanban_notification_crashed():
+    """Element 2: crashed event formatting."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="crashed", payload={}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    msg = _format_kanban_notification(ev, sub)
+    assert "worker crashed; dispatcher will retry" in msg
+
+
+def test_format_kanban_notification_timed_out():
+    """Element 2: timed_out event includes limit_seconds."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="timed_out",
+                  payload={"limit_seconds": 300}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    msg = _format_kanban_notification(ev, sub)
+    assert "timed out (max_runtime=300s)" in msg
+
+
+def test_format_kanban_notification_gave_up():
+    """Element 2: gave_up event includes error if present."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="gave_up",
+                  payload={"error": "spawn failed"}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    msg = _format_kanban_notification(ev, sub)
+    assert "gave up after repeated spawn failures" in msg
+    assert "spawn failed" in msg
+
+
+def test_format_kanban_notification_unknown_kind_returns_none():
+    """Element 2: unknown event kinds return None (no notification)."""
+    from cli import _format_kanban_notification
+
+    ev = kb.Event(id=1, task_id="t_abc", kind="created", payload={}, created_at=0)
+    sub = {"task_id": "t_abc"}
+    assert _format_kanban_notification(ev, sub) is None
+
+
+def test_cli_create_auto_subscribes(kanban_home):
+    """Element 1: hermes kanban create auto-subscribes the CLI session."""
+    out = run_slash("create 'auto-sub test' --assignee default --json")
+    task = json.loads(out)
+    tid = task["id"]
+
+    lst = run_slash(f"notify-list {tid} --json")
+    subs = json.loads(lst)
+    cli_subs = [s for s in subs if s["platform"] == "cli"]
+    assert len(cli_subs) == 1
+    assert cli_subs[0]["chat_id"].startswith("cli-")
+
+
+def test_cli_notify_subscribe_with_cli_flag(kanban_home):
+    """Element 4: notify-subscribe --cli auto-sets platform and chat_id."""
+    out = run_slash("create 'flag test' --assignee default --json")
+    task = json.loads(out)
+    tid = task["id"]
+
+    out = run_slash(f"notify-subscribe {tid} --cli")
+    assert "Subscribed cli:cli-" in out
+
+    lst = run_slash(f"notify-list {tid} --json")
+    subs = json.loads(lst)
+    assert any(s["platform"] == "cli" for s in subs)
+
+
+def test_cli_notify_list_cli_only_filter(kanban_home):
+    """Element 4: notify-list --cli-only filters to CLI subscriptions."""
+    out = run_slash("create 'filter test' --assignee default --json")
+    task = json.loads(out)
+    tid = task["id"]
+
+    # Add a telegram sub
+    run_slash(f"notify-subscribe {tid} --platform telegram --chat-id 123")
+    # Add a cli sub
+    run_slash(f"notify-subscribe {tid} --cli")
+
+    lst = run_slash(f"notify-list {tid} --cli-only --json")
+    subs = json.loads(lst)
+    assert all(s["platform"] == "cli" for s in subs)
+    assert len(subs) >= 1
+
+
+def test_cli_notify_unsubscribe_removes_sub(kanban_home):
+    """Element 4 + 5: notify-unsubscribe removes a CLI subscription."""
+    out = run_slash("create 'unsub test' --assignee default --json")
+    task = json.loads(out)
+    tid = task["id"]
+
+    run_slash(f"notify-subscribe {tid} --cli")
+    lst = run_slash(f"notify-list {tid} --json")
+    subs_before = json.loads(lst)
+    assert any(s["platform"] == "cli" for s in subs_before)
+
+    # Extract the cli chat_id
+    cli_chat = next(s["chat_id"] for s in subs_before if s["platform"] == "cli")
+    out = run_slash(f"notify-unsubscribe {tid} --platform cli --chat-id {cli_chat}")
+    assert "Unsubscribed" in out
+
+    lst = run_slash(f"notify-list {tid} --json")
+    subs_after = json.loads(lst)
+    assert not any(s["platform"] == "cli" for s in subs_after)
+
+
+def test_cli_cursor_isolation_no_db_advance(kanban_home):
+    """Element 3: CLI drain uses in-memory cursor, never advances DB cursor.
+
+    The gateway notifier skips cli platform (no adapter), so the DB
+    last_event_id stays at 0 even after CLI "consumes" events.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cursor iso", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="cli",
+                          chat_id="cli-99999", thread_id="")
+        kb.claim_task(conn, tid)
+        run_id = kb.latest_run(conn, tid).id
+        kb.complete_task(conn, tid, summary="cursor-test")
+
+        # Gateway-style unseen_events_for_sub returns the events
+        cursor, events = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="cli", chat_id="cli-99999",
+            thread_id="", kinds=("completed",),
+        )
+        assert len(events) == 1
+        assert events[0].kind == "completed"
+
+        # The DB cursor is still 0 because CLI drain never calls
+        # advance_notify_cursor().  The in-memory cursor in _kanban_cli_cursors
+        # is what tracks CLI consumption.
+        sub = kb.list_notify_subs(conn, tid)
+        cli_sub = next(s for s in sub if s["platform"] == "cli")
+        assert cli_sub["last_event_id"] == 0
+    finally:
+        conn.close()
+
+
+def test_cleanup_removes_cli_subscriptions(kanban_home, monkeypatch):
+    """Element 5: _run_cleanup removes CLI subscriptions for current PID."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cleanup test")
+        fake_pid = 12345678
+        kb.add_notify_sub(conn, task_id=tid, platform="cli",
+                          chat_id=f"cli-{fake_pid}", thread_id="")
+        # Verify sub exists
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+    # Monkeypatch os.getpid to match the fake subscription
+    monkeypatch.setattr(os, "getpid", lambda: fake_pid)
+
+    # Import and run cleanup
+    import cli as _cli_module
+    _cli_module._run_cleanup()
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        cli_subs = [s for s in subs if s["platform"] == "cli"]
+        assert len(cli_subs) == 0, "cleanup should remove CLI subscriptions"
+    finally:
+        conn.close()

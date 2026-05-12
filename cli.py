@@ -743,6 +743,22 @@ def _run_cleanup():
                 _active_agent_ref.shutdown_memory_provider()
     except Exception:
         pass
+    # Clean up CLI kanban subscriptions so they don't leak across sessions.
+    try:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect()
+        try:
+            subs = _kb.list_notify_subs(conn)
+            for sub in subs:
+                if sub.get("platform") == "cli" and sub.get("chat_id") == f"cli-{os.getpid()}":
+                    _kb.remove_notify_sub(
+                        conn, task_id=sub["task_id"], platform="cli",
+                        chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                    )
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1744,6 +1760,43 @@ def _format_process_notification(evt: dict) -> "str | None":
     )
 
 
+def _format_kanban_notification(ev, sub) -> "str | None":
+    """Format a kanban task event into a [IMPORTANT: ...] message.
+
+    Mirrors the process_registry notification style so both notification
+    sources look consistent in the CLI.
+    """
+    kind = ev.kind if hasattr(ev, 'kind') else ev.get('kind')
+    task_id = sub["task_id"]
+
+    if kind == "completed":
+        handoff = ""
+        payload = ev.payload if hasattr(ev, 'payload') else ev.get('payload', {})
+        if payload and payload.get("summary"):
+            h = str(payload["summary"]).strip().splitlines()[0][:200]
+            handoff = f"\n{h}"
+        return f"[IMPORTANT: Kanban task {task_id} done{handoff}]"
+    elif kind == "blocked":
+        reason = ""
+        payload = ev.payload if hasattr(ev, 'payload') else ev.get('payload', {})
+        if payload and payload.get("reason"):
+            reason = f": {str(payload['reason'])[:160]}"
+        return f"[IMPORTANT: Kanban task {task_id} blocked{reason}]"
+    elif kind == "crashed":
+        return f"[IMPORTANT: Kanban task {task_id} worker crashed; dispatcher will retry]"
+    elif kind == "timed_out":
+        payload = ev.payload if hasattr(ev, 'payload') else ev.get('payload', {})
+        limit = int(payload.get("limit_seconds", 0)) if payload else 0
+        return f"[IMPORTANT: Kanban task {task_id} timed out (max_runtime={limit}s); will retry]"
+    elif kind == "gave_up":
+        payload = ev.payload if hasattr(ev, 'payload') else ev.get('payload', {})
+        err = ""
+        if payload and payload.get("error"):
+            err = f"\n{str(payload['error'])[:200]}"
+        return f"[IMPORTANT: Kanban task {task_id} gave up after repeated spawn failures{err}]"
+    return None
+
+
 def _detect_file_drop(user_input: str) -> "dict | None":
     """Detect if *user_input* starts with a real local file path.
 
@@ -2593,6 +2646,7 @@ class HermesCLI:
         # mode does not go through run().
         self._agent_running = False
         self._pending_input = queue.Queue()
+        self._kanban_cli_cursors: dict = {}
         self._interrupt_queue = queue.Queue()
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
@@ -7168,6 +7222,172 @@ class HermesCLI:
         print(f"(._.) Unknown cron command: {subcommand}")
         print("  Available: list, add, edit, pause, resume, run, remove")
 
+    def _handle_loop_command(self, cmd: str):
+        """Handle /loop <schedule> <prompt> — thin wrapper around cronjob tool.
+
+        Creates a recurring cron job from natural language input.
+        Subcommands: list, pause, resume, remove.
+        """
+        import json
+        import shlex
+        from tools.cronjob_tools import cronjob as cronjob_tool
+        from cron.jobs import get_job
+
+        def _cron_api(**kwargs):
+            return json.loads(cronjob_tool(**kwargs))
+
+        tokens = shlex.split(cmd)
+
+        # No args → show usage + list
+        if len(tokens) == 1:
+            print()
+            print("+" + "-" * 68 + "+")
+            print("|" + " " * 22 + "(^_^) /loop — Scheduled Prompts" + " " * 23 + "|")
+            print("+" + "-" * 68 + "+")
+            print()
+            print("  Usage:")
+            print('    /loop <schedule> <prompt>     e.g. /loop 5m "check deployment"')
+            print('    /loop list                    Show all loop jobs')
+            print('    /loop pause <job_id>          Pause a loop job')
+            print('    /loop resume <job_id>         Resume a paused loop job')
+            print('    /loop remove <job_id>         Delete a loop job')
+            print()
+            print("  Schedules:  5m, 30m, 2h, 1d, every 5m, every 2h, 0 9 * * *")
+            print()
+
+            result = _cron_api(action="list", include_disabled=True)
+            jobs = result.get("jobs", []) if result.get("success") else []
+            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
+            if loop_jobs:
+                print("  Loop Jobs:")
+                print("  " + "-" * 63)
+                for job in loop_jobs:
+                    state = job.get("state", "?")
+                    state_icon = "▶" if state == "active" else "⏸"
+                    print(f"    {state_icon} {job['job_id'][:12]:<12} | {job['schedule']:<15} | {job.get('repeat', 'forever')}")
+                    print(f"      {job.get('prompt_preview', '')}")
+                    if job.get("next_run_at"):
+                        print(f"      Next: {job['next_run_at']}")
+                    print()
+            else:
+                print("  No loop jobs. Use '/loop <schedule> <prompt>' to create one.")
+            print()
+            return
+
+        subcommand = tokens[1].lower()
+
+        # /loop list
+        if subcommand == "list":
+            result = _cron_api(action="list", include_disabled=True)
+            jobs = result.get("jobs", []) if result.get("success") else []
+            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
+            if not loop_jobs:
+                print("(._.) No loop jobs found.")
+                return
+            print()
+            print("Loop Jobs:")
+            print("-" * 80)
+            for job in loop_jobs:
+                print(f"  ID: {job['job_id']}")
+                print(f"  Name: {job['name']}")
+                print(f"  State: {job.get('state', '?')}")
+                print(f"  Schedule: {job['schedule']} ({job.get('repeat', '?')})")
+                print(f"  Next run: {job.get('next_run_at', 'N/A')}")
+                print(f"  Prompt: {job.get('prompt_preview', '')}")
+                if job.get("last_run_at"):
+                    print(f"  Last run: {job['last_run_at']} ({job.get('last_status', '?')})")
+                print()
+            return
+
+        # /loop pause <job_id>
+        if subcommand == "pause":
+            if len(tokens) < 3:
+                print("(._.) Usage: /loop pause <job_id>")
+                return
+            job_id = tokens[2]
+            result = _cron_api(action="pause", job_id=job_id, reason="paused from /loop")
+            if result.get("success"):
+                print(f"(^_^)b Paused loop job: {result['job']['name']} ({job_id})")
+            else:
+                print(f"(x_x) Failed to pause: {result.get('error')}")
+            return
+
+        # /loop resume <job_id>
+        if subcommand == "resume":
+            if len(tokens) < 3:
+                print("(._.) Usage: /loop resume <job_id>")
+                return
+            job_id = tokens[2]
+            result = _cron_api(action="resume", job_id=job_id)
+            if result.get("success"):
+                print(f"(^_^)b Resumed loop job: {result['job']['name']} ({job_id})")
+                print(f"  Next run: {result['job'].get('next_run_at')}")
+            else:
+                print(f"(x_x) Failed to resume: {result.get('error')}")
+            return
+
+        # /loop remove <job_id>
+        if subcommand == "remove":
+            if len(tokens) < 3:
+                print("(._.) Usage: /loop remove <job_id>")
+                return
+            job_id = tokens[2]
+            result = _cron_api(action="remove", job_id=job_id)
+            if result.get("success"):
+                print(f"(^_^)b Removed loop job: {result.get('removed_job', {}).get('name', job_id)}")
+            else:
+                print(f"(x_x) Failed to remove: {result.get('error')}")
+            return
+
+        # /loop <schedule> <prompt>  (create)
+        # Try to parse: first token is schedule, rest is prompt
+        # Handle "every 5m" syntax where "every" + next token form the schedule
+        if tokens[1].lower() == "every" and len(tokens) > 2:
+            schedule = f"every {tokens[2]}"
+            prompt = " ".join(tokens[3:]) if len(tokens) > 3 else ""
+        else:
+            schedule = tokens[1]
+            prompt = " ".join(tokens[2:]) if len(tokens) > 2 else ""
+
+        if not prompt:
+            print("(._.) Usage: /loop <schedule> <prompt>")
+            print('  Example: /loop 5m "check deployment status"')
+            print('  Example: /loop every 30m "summarize news"')
+            return
+
+        # Warn if interval looks very short
+        from cron.jobs import parse_duration
+        try:
+            minutes = parse_duration(schedule.lstrip("every "))
+            if minutes < 1:
+                print("⚠ Interval is very short (< 1 minute). The scheduler ticks every 60s, so this may not fire as expected.")
+        except Exception:
+            pass  # Not a simple duration — could be cron expr or "every X" form
+
+        # Check if gateway is running (best-effort)
+        try:
+            from hermes_cli.cron import _is_gateway_running
+            if not _is_gateway_running():
+                print("⚠ No gateway is running. The job will be scheduled but will not execute until a gateway starts.")
+        except Exception:
+            pass
+
+        name = f"loop: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+        result = _cron_api(
+            action="create",
+            schedule=schedule,
+            prompt=prompt,
+            name=name,
+            deliver="origin",
+        )
+        if result.get("success"):
+            print(f"(^_^)b Loop job created: {result['job_id']}")
+            print(f"  Schedule: {result['schedule']}")
+            print(f"  Next run: {result['next_run_at']}")
+            print(f"  To stop: /loop remove {result['job_id']}")
+        else:
+            print(f"(x_x) Failed to create loop: {result.get('error')}")
+
     def _handle_curator_command(self, cmd: str):
         """Handle /curator slash command.
 
@@ -7478,6 +7698,8 @@ class HermesCLI:
             self.save_conversation()
         elif canonical == "cron":
             self._handle_cron_command(cmd_original)
+        elif canonical == "loop":
+            self._handle_loop_command(cmd_original)
         elif canonical == "curator":
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
@@ -12915,6 +13137,23 @@ class HermesCLI:
         def process_loop():
             while not self._should_exit:
                 try:
+                    # Drain background process notifications (completions
+                    # and watch pattern matches) on every iteration so they
+                    # aren't missed when the user sends a message.
+                    try:
+                        from tools.process_registry import process_registry
+                        if not process_registry.completion_queue.empty():
+                            evt = process_registry.completion_queue.get_nowait()
+                            _evt_sid = evt.get("session_id", "")
+                            if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+                                pass  # already delivered via tool result
+                            else:
+                                _synth = _format_process_notification(evt)
+                                if _synth:
+                                    self._pending_input.put(_synth)
+                    except Exception:
+                        pass
+
                     # Check for pending input with timeout
                     try:
                         user_input = self._pending_input.get(timeout=0.1)
@@ -12922,22 +13161,6 @@ class HermesCLI:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
                             self._check_config_mcp_changes()
-                            # Check for background process notifications (completions
-                            # and watch pattern matches) while agent is idle.
-                            try:
-                                from tools.process_registry import process_registry
-                                if not process_registry.completion_queue.empty():
-                                    evt = process_registry.completion_queue.get_nowait()
-                                    # Skip if the agent already consumed this via wait/poll/log
-                                    _evt_sid = evt.get("session_id", "")
-                                    if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-                                        pass  # already delivered via tool result
-                                    else:
-                                        _synth = _format_process_notification(evt)
-                                        if _synth:
-                                            self._pending_input.put(_synth)
-                            except Exception:
-                                pass
                         continue
                     
                     if not user_input:
@@ -13054,6 +13277,50 @@ class HermesCLI:
                 except Exception as e:
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
         
+        # Start kanban event drain thread (notification bridge for CLI)
+        def _kanban_drain_loop():
+            """Poll kanban task_events for CLI-subscribed tasks and inject notifications."""
+            import time
+            try:
+                from hermes_cli import kanban_db as _kb
+            except Exception:
+                return  # kanban DB not available in this environment
+
+            while not self._should_exit:
+                try:
+                    conn = _kb.connect()
+                    try:
+                        subs = _kb.list_notify_subs(conn)
+                        for sub in subs:
+                            if sub.get("platform") != "cli":
+                                continue
+                            cursor_key = (sub["task_id"], sub["chat_id"])
+                            last_cursor = self._kanban_cli_cursors.get(cursor_key, 0)
+
+                            _, events = _kb.unseen_events_for_sub(
+                                conn, task_id=sub["task_id"], platform="cli",
+                                chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                                kinds=("completed", "blocked", "gave_up", "crashed", "timed_out"),
+                            )
+                            if events:
+                                max_id = max(
+                                    last_cursor,
+                                    max((e.id if hasattr(e, "id") else e.get("id", 0)) for e in events),
+                                )
+                                self._kanban_cli_cursors[cursor_key] = max_id
+                            for ev in events:
+                                msg = _format_kanban_notification(ev, sub)
+                                if msg:
+                                    self._pending_input.put(msg)
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass  # Non-fatal; don't break the drain loop
+                time.sleep(5.0)
+
+        kanban_notify_thread = threading.Thread(target=_kanban_drain_loop, daemon=True, name="kanban-drain")
+        kanban_notify_thread.start()
+
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()

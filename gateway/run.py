@@ -6536,6 +6536,9 @@ class GatewayRunner:
         if canonical == "background":
             return await self._handle_background_command(event)
 
+        if canonical == "loop":
+            return await self._handle_loop_command(event)
+
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
             # Strip the prefix so downstream treats it as a normal user
@@ -10309,6 +10312,121 @@ class GatewayRunner:
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    async def _handle_loop_command(self, event: MessageEvent) -> str:
+        """Handle /loop in gateway — thin wrapper around cronjob tool.
+
+        Creates a recurring cron job from a single slash command.
+        Subcommands: list, pause, resume, remove.
+        """
+        import json
+        import shlex
+        from tools.cronjob_tools import cronjob as cronjob_tool
+        from cron.jobs import get_job
+
+        def _cron_api(**kwargs):
+            return json.loads(cronjob_tool(**kwargs))
+
+        text = (event.text or "").strip()
+        # Strip leading "/loop" leaving args
+        if text.startswith("/"):
+            text = text.lstrip("/")
+        if text.startswith("loop"):
+            text = text[len("loop"):].lstrip()
+
+        tokens = shlex.split(text)
+
+        # No args → show usage + list
+        if not tokens:
+            result = _cron_api(action="list", include_disabled=True)
+            jobs = result.get("jobs", []) if result.get("success") else []
+            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
+            lines = [
+                "*/loop <schedule> <prompt>* — e.g. `/loop 5m check deployment`",
+                "Subcommands: `list`, `pause <id>`, `resume <id>`, `remove <id>`",
+            ]
+            if loop_jobs:
+                lines.append("")
+                lines.append(f"*{len(loop_jobs)} loop job(s):*")
+                for job in loop_jobs:
+                    state_icon = "▶" if job.get("state") == "active" else "⏸"
+                    lines.append(f"  {state_icon} `{job['job_id'][:12]}` | {job['schedule']} | {job.get('prompt_preview', '')}")
+            else:
+                lines.append("No loop jobs. Create one with `/loop <schedule> <prompt>`.")
+            return "\n".join(lines)
+
+        subcommand = tokens[0].lower()
+
+        # list
+        if subcommand == "list":
+            result = _cron_api(action="list", include_disabled=True)
+            jobs = result.get("jobs", []) if result.get("success") else []
+            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
+            if not loop_jobs:
+                return "No loop jobs found."
+            lines = ["*Loop Jobs:*"]
+            for job in loop_jobs:
+                lines.append(f"• `{job['job_id']}` | {job['schedule']} | {job.get('state', '?')} | {job.get('prompt_preview', '')}")
+            return "\n".join(lines)
+
+        # pause
+        if subcommand == "pause":
+            if len(tokens) < 2:
+                return "Usage: `/loop pause <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="pause", job_id=job_id, reason="paused from /loop")
+            if result.get("success"):
+                return f"⏸ Paused loop job `{job_id}`"
+            return f"⚠ Failed to pause: {result.get('error')}"
+
+        # resume
+        if subcommand == "resume":
+            if len(tokens) < 2:
+                return "Usage: `/loop resume <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="resume", job_id=job_id)
+            if result.get("success"):
+                return f"▶ Resumed loop job `{job_id}` — next run: {result['job'].get('next_run_at', 'N/A')}"
+            return f"⚠ Failed to resume: {result.get('error')}"
+
+        # remove
+        if subcommand == "remove":
+            if len(tokens) < 2:
+                return "Usage: `/loop remove <job_id>`"
+            job_id = tokens[1]
+            result = _cron_api(action="remove", job_id=job_id)
+            if result.get("success"):
+                return f"🗑 Removed loop job `{job_id}`"
+            return f"⚠ Failed to remove: {result.get('error')}"
+
+        # Create: /loop <schedule> <prompt>
+        # Handle "every 5m" syntax where "every" + next token form the schedule
+        if tokens[0].lower() == "every" and len(tokens) > 1:
+            schedule = f"every {tokens[1]}"
+            prompt = " ".join(tokens[2:]) if len(tokens) > 2 else ""
+        else:
+            schedule = tokens[0]
+            prompt = " ".join(tokens[1:]) if len(tokens) > 1 else ""
+
+        if not prompt:
+            return "Usage: `/loop <schedule> <prompt>`\nExample: `/loop 5m check deployment`"
+
+        name = f"loop: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+        result = _cron_api(
+            action="create",
+            schedule=schedule,
+            prompt=prompt,
+            name=name,
+            deliver="origin",
+        )
+        if result.get("success"):
+            return (
+                f"✅ Loop job created: `{result['job_id']}`\n"
+                f"Schedule: {result['schedule']}\n"
+                f"Next run: {result['next_run_at']}\n"
+                f"To stop: `/loop remove {result['job_id']}`"
+            )
+        return f"⚠ Failed to create loop: {result.get('error')}"
 
     async def _run_background_task(
         self,

@@ -36,6 +36,9 @@ try:
 except Exception:
     OPUS_AVAILABLE = False
 
+if not OPUS_AVAILABLE:
+    pytest.skip("libopus not available", allow_module_level=True)
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from gateway.platforms.discord import VoiceReceiver

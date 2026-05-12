@@ -14,6 +14,12 @@ import pytest
 from tools import browser_tool as bt
 
 
+def _fail_popen(*args, **kwargs):
+    """Belt-and-suspenders: if code tries to spawn browser when Chromium
+    is missing, fail the test immediately instead of hanging."""
+    raise RuntimeError("subprocess.Popen should not be called — Chromium is missing")
+
+
 @pytest.fixture(autouse=True)
 def _reset_chromium_cache():
     bt._cached_chromium_installed = None

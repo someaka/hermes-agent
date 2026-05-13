@@ -9804,59 +9804,14 @@ class GatewayRunner:
         source: Any,
         final_response: str,
     ) -> None:
-        """Run the loop evaluator after a gateway turn and, if active and
-        interval elapsed, enqueue a continuation prompt for the same session.
+        """No-op — loop is driven by background scheduler, not post-turn hook.
+
+        The LoopScheduler daemon thread in the CLI handles interval checks
+        and prompt injection.  The gateway does not drive loop continuations
+        directly.  This method exists only to keep the import/attribute
+        contract stable for tests.
         """
-        try:
-            from hermes_cli.loop import LoopManager
-        except Exception as exc:
-            logger.debug("loop continuation: loop module unavailable: %s", exc)
-            return
-
-        sid = getattr(session_entry, "session_id", None) or ""
-        if not sid:
-            return
-
-        # Goal takes priority
-        try:
-            from hermes_cli.goals import GoalManager
-            goal_mgr = GoalManager(session_id=sid, default_max_turns=self._goal_max_turns_from_config())
-            if goal_mgr.is_active():
-                return
-        except Exception:
-            pass
-
-        mgr = LoopManager(session_id=sid)
-        if not mgr.is_active():
-            return
-
-        decision = mgr.evaluate_after_turn(user_initiated=True)
-        msg = decision.get("message") or ""
-
-        if msg and source is not None:
-            await self._defer_loop_status_notice_after_delivery(source, msg)
-
-        if not decision.get("should_continue"):
-            return
-
-        prompt = decision.get("continuation_prompt") or ""
-        if not prompt or source is None:
-            return
-
-        try:
-            adapter = self.adapters.get(source.platform)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                cont_event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
-        except Exception as exc:
-            logger.debug("loop continuation: enqueue failed: %s", exc)
+        pass
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""

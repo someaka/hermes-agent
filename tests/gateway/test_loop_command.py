@@ -1,18 +1,18 @@
-"""Tests for /loop gateway command.
+"""Tests for /loop gateway command — LoopManager-based same-session continuation.
 
-Verifies that the gateway handler correctly dispatches, parses args, and
-returns markdown-formatted responses.
+Verifies that the gateway handler correctly dispatches subcommands,
+parses interval prefixes, and integrates with LoopManager.
 """
 
-import asyncio
-import json
+from __future__ import annotations
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -42,6 +42,7 @@ def _make_runner():
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
+    adapter._pending_messages = {}
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
@@ -57,232 +58,371 @@ def _make_runner():
     runner._show_reasoning = False
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._queued_events = {}
     return runner
 
 
-def _mock_cron_api(success=True, **extra):
-    """Return a mock cronjob_tool that returns JSON with given fields."""
-    def _cron_tool(**kwargs):
-        result = {"success": success, **extra}
-        return json.dumps(result)
-    return _cron_tool
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME so SessionDB.state_meta writes don't clobber the real one."""
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import loop
+
+    loop._DB_CACHE.clear()
+    yield home
+    loop._DB_CACHE.clear()
 
 
 # ------------------------------------------------------------------
-# Gateway dispatch tests
+# Gateway /loop handler tests
 # ------------------------------------------------------------------
 
 class TestLoopCommandGateway:
 
     @pytest.mark.asyncio
-    async def test_no_args_shows_usage_and_list(self):
-        """/loop with no args returns usage + job list."""
+    async def test_no_args_shows_status_when_none(self, hermes_home):
+        """/loop with no args shows 'No active loop' when none set."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-1"
+        runner.session_store.get_or_create_session.return_value = session_entry
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=[])):
-            result = await runner._handle_loop_command(_make_event("/loop"))
+        result = await runner._handle_loop_command(_make_event("/loop"))
 
-        assert "*/loop <schedule> <prompt>*" in result
-        assert "Subcommands:" in result
-        assert "No loop jobs" in result
+        assert "No active loop" in result
 
     @pytest.mark.asyncio
-    async def test_no_args_with_jobs(self):
-        """/loop with no args lists existing loop jobs."""
+    async def test_set_prompt(self, hermes_home):
+        """/loop <prompt> creates a loop and kicks off immediately."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-2"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-2"
 
-        jobs = [
-            {"job_id": "loop_abc123", "name": "loop: check deployment", "schedule": "5m", "state": "active", "prompt_preview": "check deployment"},
-        ]
+        result = await runner._handle_loop_command(_make_event("/loop check deployment"))
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=jobs)):
-            result = await runner._handle_loop_command(_make_event("/loop"))
-
-        assert "1 loop job(s)" in result
-        assert "loop_abc123" in result
-        assert "▶" in result  # active icon
+        assert "Loop set" in result
+        assert "check deployment" in result
+        assert "300s interval" in result  # default
+        runner._enqueue_fifo.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_create_parses_schedule_and_prompt(self):
-        """/loop 5m check deployment creates a job."""
+    async def test_set_with_interval(self, hermes_home):
+        """/loop 5m check deployment parses interval prefix."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-3"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-3"
 
-        calls = []
-        def _capture_cronjob(**kwargs):
-            calls.append(kwargs)
-            return json.dumps({
-                "success": True,
-                "job_id": "loop_abc123",
-                "schedule": "5m",
-                "next_run_at": "2026-05-09T17:00:00Z",
-            })
+        result = await runner._handle_loop_command(_make_event("/loop 5m check deployment"))
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_capture_cronjob):
-            result = await runner._handle_loop_command(_make_event("/loop 5m check deployment"))
-
-        assert len(calls) == 1
-        assert calls[0]["action"] == "create"
-        assert calls[0]["schedule"] == "5m"
-        assert calls[0]["prompt"] == "check deployment"
-        assert calls[0]["name"].startswith("loop:")
-        assert calls[0]["deliver"] == "origin"
-        assert "✅ Loop job created" in result
-        assert "`loop_abc123`" in result
+        assert "Loop set" in result
+        assert "300s interval" in result
+        assert "check deployment" in result
+        runner._enqueue_fifo.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_create_empty_prompt_error(self):
-        """/loop 5m with no prompt returns usage error."""
+    async def test_set_every_syntax(self, hermes_home):
+        """/loop every 30m summarize news parses 'every' prefix."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-4"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-4"
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api()):
-            result = await runner._handle_loop_command(_make_event("/loop 5m"))
+        result = await runner._handle_loop_command(_make_event("/loop every 30m summarize news"))
 
-        assert "Usage:" in result
-        assert "Example:" in result
+        assert "Loop set" in result
+        assert "1800s interval" in result
+        assert "summarize news" in result
+        runner._enqueue_fifo.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_list_subcommand(self):
-        """/loop list filters by loop: prefix."""
+    async def test_set_empty_prompt_error(self, hermes_home):
+        """/loop 5m with no prompt returns usage."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-5"
+        runner.session_store.get_or_create_session.return_value = session_entry
 
-        jobs = [
-            {"job_id": "j1", "name": "loop: check deployment", "schedule": "5m", "state": "active", "prompt_preview": "check deployment"},
-            {"job_id": "j2", "name": "regular job", "schedule": "1h", "state": "active"},
-        ]
-
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=jobs)):
-            result = await runner._handle_loop_command(_make_event("/loop list"))
-
-        assert "*Loop Jobs:*" in result
-        assert "j1" in result
-        assert "regular job" not in result
-
-    @pytest.mark.asyncio
-    async def test_list_no_jobs(self):
-        """/loop list with no loop jobs returns friendly message."""
-        runner = _make_runner()
-
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=[])):
-            result = await runner._handle_loop_command(_make_event("/loop list"))
-
-        assert "No loop jobs found" in result
-
-    @pytest.mark.asyncio
-    async def test_pause_subcommand(self):
-        """/loop pause <id> pauses the job."""
-        runner = _make_runner()
-
-        calls = []
-        def _capture_cronjob(**kwargs):
-            calls.append(kwargs)
-            return json.dumps({"success": True, "job": {"name": "loop: test"}})
-
-        with patch("tools.cronjob_tools.cronjob", side_effect=_capture_cronjob):
-            result = await runner._handle_loop_command(_make_event("/loop pause abc123"))
-
-        assert len(calls) == 1
-        assert calls[0]["action"] == "pause"
-        assert calls[0]["job_id"] == "abc123"
-        assert calls[0]["reason"] == "paused from /loop"
-        assert "⏸ Paused loop job" in result
-
-    @pytest.mark.asyncio
-    async def test_pause_missing_id(self):
-        """/loop pause without id returns usage."""
-        runner = _make_runner()
-
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api()):
-            result = await runner._handle_loop_command(_make_event("/loop pause"))
+        result = await runner._handle_loop_command(_make_event("/loop 5m"))
 
         assert "Usage:" in result
 
     @pytest.mark.asyncio
-    async def test_resume_subcommand(self):
-        """/loop resume <id> resumes the job."""
+    async def test_status_shows_active_loop(self, hermes_home):
+        """/loop status shows active loop details."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-6"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-6"
 
-        calls = []
-        def _capture_cronjob(**kwargs):
-            calls.append(kwargs)
-            return json.dumps({"success": True, "job": {"name": "loop: test", "next_run_at": "2026-05-09T18:00:00Z"}})
+        await runner._handle_loop_command(_make_event("/loop check deployment"))
+        result = await runner._handle_loop_command(_make_event("/loop status"))
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_capture_cronjob):
-            result = await runner._handle_loop_command(_make_event("/loop resume abc123"))
-
-        assert len(calls) == 1
-        assert calls[0]["action"] == "resume"
-        assert calls[0]["job_id"] == "abc123"
-        assert "▶ Resumed loop job" in result
-        assert "next run" in result.lower()
+        assert "active" in result.lower()
+        assert "check deployment" in result
 
     @pytest.mark.asyncio
-    async def test_resume_missing_id(self):
-        """/loop resume without id returns usage."""
+    async def test_pause_subcommand(self, hermes_home):
+        """/loop pause pauses the active loop."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-7"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-7"
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api()):
-            result = await runner._handle_loop_command(_make_event("/loop resume"))
+        await runner._handle_loop_command(_make_event("/loop check deployment"))
+        result = await runner._handle_loop_command(_make_event("/loop pause"))
 
-        assert "Usage:" in result
+        assert "Loop paused" in result
+        assert "check deployment" in result
 
     @pytest.mark.asyncio
-    async def test_remove_subcommand(self):
-        """/loop remove <id> deletes the job."""
+    async def test_resume_subcommand(self, hermes_home):
+        """/loop resume resumes a paused loop."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-8"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-8"
 
-        calls = []
-        def _capture_cronjob(**kwargs):
-            calls.append(kwargs)
-            return json.dumps({"success": True, "removed_job": {"name": "loop: test"}})
+        await runner._handle_loop_command(_make_event("/loop check deployment"))
+        await runner._handle_loop_command(_make_event("/loop pause"))
+        result = await runner._handle_loop_command(_make_event("/loop resume"))
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_capture_cronjob):
-            result = await runner._handle_loop_command(_make_event("/loop remove abc123"))
-
-        assert len(calls) == 1
-        assert calls[0]["action"] == "remove"
-        assert calls[0]["job_id"] == "abc123"
-        assert "🗑 Removed loop job" in result
+        assert "Loop resumed" in result
+        assert "check deployment" in result
 
     @pytest.mark.asyncio
-    async def test_remove_missing_id(self):
-        """/loop remove without id returns usage."""
+    async def test_clear_subcommand(self, hermes_home):
+        """/loop clear clears the active loop."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-9"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-9"
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api()):
-            result = await runner._handle_loop_command(_make_event("/loop remove"))
+        await runner._handle_loop_command(_make_event("/loop check deployment"))
+        result = await runner._handle_loop_command(_make_event("/loop clear"))
 
-        assert "Usage:" in result
+        assert "Loop cleared" in result
 
     @pytest.mark.asyncio
-    async def test_create_failure(self):
-        """Failed create returns error markdown."""
+    async def test_clear_when_no_loop(self, hermes_home):
+        """/loop clear when no loop shows friendly message."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-10"
+        runner.session_store.get_or_create_session.return_value = session_entry
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(success=False, error="Invalid schedule")):
-            result = await runner._handle_loop_command(_make_event("/loop bad check deployment"))
+        result = await runner._handle_loop_command(_make_event("/loop clear"))
 
-        assert "⚠ Failed to create loop" in result
-        assert "Invalid schedule" in result
+        assert "No active loop" in result
 
     @pytest.mark.asyncio
-    async def test_strip_loop_prefix_variants(self):
-        """Handler strips /loop, loop, and leading slash correctly."""
+    async def test_pause_when_no_loop(self, hermes_home):
+        """/loop pause when no loop shows friendly message."""
         runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-11"
+        runner.session_store.get_or_create_session.return_value = session_entry
 
-        calls = []
-        def _capture_cronjob(**kwargs):
-            calls.append(kwargs)
-            return json.dumps({"success": True, "job_id": "loop_xyz", "schedule": "1h", "next_run_at": "2026-05-09T18:00:00Z"})
+        result = await runner._handle_loop_command(_make_event("/loop pause"))
 
-        with patch("tools.cronjob_tools.cronjob", side_effect=_capture_cronjob):
-            result = await runner._handle_loop_command(_make_event("loop 1h test prompt"))
+        assert "No loop set" in result
 
-        assert calls[0]["schedule"] == "1h"
-        assert calls[0]["prompt"] == "test prompt"
+    @pytest.mark.asyncio
+    async def test_resume_when_no_loop(self, hermes_home):
+        """/loop resume when no loop shows friendly message."""
+        runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "gw-sid-12"
+        runner.session_store.get_or_create_session.return_value = session_entry
+
+        result = await runner._handle_loop_command(_make_event("/loop resume"))
+
+        assert "No loop to resume" in result
 
     @pytest.mark.asyncio
     async def test_gateway_known_command_auto_registered(self):
         """Adding CommandDef to registry auto-registers loop as gateway-known."""
         from hermes_cli.commands import is_gateway_known_command
         assert is_gateway_known_command("loop") is True
-        assert is_gateway_known_command("repeat") is True  # alias
+
+
+# ------------------------------------------------------------------
+# _post_turn_loop_continuation hook tests
+# ------------------------------------------------------------------
+
+class TestLoopContinuationHook:
+
+    @pytest.mark.asyncio
+    async def test_post_turn_loop_continuation_enqueues_event(self, hermes_home):
+        """_post_turn_loop_continuation enqueues a continuation event when interval elapsed."""
+        runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "hook-gw-sid-1"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-hook-1"
+
+        # Set up an active loop
+        from hermes_cli.loop import LoopManager
+        loop_mgr = LoopManager(session_id="hook-gw-sid-1")
+        loop_mgr.set("check deployment")
+
+        await runner._post_turn_loop_continuation(
+            session_entry=session_entry,
+            source=_make_source(),
+            final_response="all good",
+        )
+
+        runner._enqueue_fifo.assert_called_once()
+        args, _ = runner._enqueue_fifo.call_args
+        assert "[Loop check] check deployment" in args[1].text
+
+    @pytest.mark.asyncio
+    async def test_goal_priority_over_loop(self, hermes_home):
+        """When goal is active, loop continuation is skipped."""
+        runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "hook-gw-sid-2"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-hook-2"
+
+        # Set an active goal
+        from hermes_cli.goals import GoalManager
+        goal_mgr = GoalManager(session_id="hook-gw-sid-2")
+        goal_mgr.set("do the thing")
+
+        # Set an active loop
+        from hermes_cli.loop import LoopManager
+        loop_mgr = LoopManager(session_id="hook-gw-sid-2")
+        loop_mgr.set("check deployment")
+
+        await runner._post_turn_loop_continuation(
+            session_entry=session_entry,
+            source=_make_source(),
+            final_response="all good",
+        )
+
+        runner._enqueue_fifo.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_loop_skips_when_interval_not_elapsed(self, hermes_home):
+        """Loop continuation skips when interval hasn't elapsed."""
+        runner = _make_runner()
+        session_entry = MagicMock()
+        session_entry.session_id = "hook-gw-sid-3"
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner._enqueue_fifo = MagicMock()
+        runner._session_key_for_source = lambda _s: "key-hook-3"
+
+        from hermes_cli.loop import LoopManager, save_loop
+        loop_mgr = LoopManager(session_id="hook-gw-sid-3")
+        loop_mgr.set("check deployment", interval_seconds=300)
+        loop_mgr.state.last_fired_at = __import__("time").time()
+        save_loop("hook-gw-sid-3", loop_mgr.state)
+
+        await runner._post_turn_loop_continuation(
+            session_entry=session_entry,
+            source=_make_source(),
+            final_response="all good",
+        )
+
+        runner._enqueue_fifo.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# Synthetic event detection tests
+# ------------------------------------------------------------------
+
+class TestLoopSyntheticEventDetection:
+
+    def test_is_loop_continuation_event_matches(self):
+        """_is_loop_continuation_event returns True for loop continuations."""
+        from gateway.run import GatewayRunner
+        event = MagicMock()
+        event.text = "[Loop check] check deployment"
+        assert GatewayRunner._is_loop_continuation_event(event) is True
+
+    def test_is_loop_continuation_event_no_match(self):
+        """_is_loop_continuation_event returns False for regular messages."""
+        from gateway.run import GatewayRunner
+        event = MagicMock()
+        event.text = "hello world"
+        assert GatewayRunner._is_loop_continuation_event(event) is False
+
+    def test_clear_loop_pending_continuations_removes_loop_events(self):
+        """_clear_loop_pending_continuations removes only loop continuation events."""
+        from gateway.run import GatewayRunner
+        runner = _make_runner()
+
+        loop_event = MagicMock()
+        loop_event.text = "[Loop check] check deployment"
+        normal_event = MagicMock()
+        normal_event.text = "hello world"
+
+        adapter = runner.adapters[Platform.TELEGRAM]
+        adapter._pending_messages = {"key-1": loop_event}
+        runner._queued_events = {"key-1": [loop_event, normal_event]}
+
+        removed = runner._clear_loop_pending_continuations("key-1", adapter)
+        assert removed == 2
+        assert "key-1" not in adapter._pending_messages
+        assert runner._queued_events["key-1"] == [normal_event]
+
+
+# ------------------------------------------------------------------
+# Stale continuation discard tests
+# ------------------------------------------------------------------
+
+class TestLoopStaleContinuation:
+
+    def test_loop_still_active_for_session_true(self, hermes_home):
+        """_loop_still_active_for_session returns True when loop is active."""
+        from gateway.run import GatewayRunner
+        runner = _make_runner()
+
+        from hermes_cli.loop import LoopManager
+        loop_mgr = LoopManager(session_id="stale-sid-1")
+        loop_mgr.set("check deployment")
+
+        assert runner._loop_still_active_for_session("stale-sid-1") is True
+
+    def test_loop_still_active_for_session_false(self, hermes_home):
+        """_loop_still_active_for_session returns False when loop is paused."""
+        from gateway.run import GatewayRunner
+        runner = _make_runner()
+
+        from hermes_cli.loop import LoopManager
+        loop_mgr = LoopManager(session_id="stale-sid-2")
+        loop_mgr.set("check deployment")
+        loop_mgr.pause()
+
+        assert runner._loop_still_active_for_session("stale-sid-2") is False
+
+    def test_loop_still_active_for_session_none(self):
+        """_loop_still_active_for_session returns False when no loop exists."""
+        from gateway.run import GatewayRunner
+        runner = _make_runner()
+
+        assert runner._loop_still_active_for_session("stale-sid-none") is False

@@ -2148,6 +2148,49 @@ class GatewayRunner:
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
+    @staticmethod
+    def _is_loop_continuation_event(event_or_text: Any) -> bool:
+        """Return True for synthetic /loop continuation turns."""
+        text = getattr(event_or_text, "text", event_or_text) or ""
+        return str(text).startswith("[Loop check]")
+
+    def _clear_loop_pending_continuations(self, session_key: str, adapter: Any) -> int:
+        """Remove queued synthetic /loop continuations for one session."""
+        removed = 0
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if isinstance(pending_slot, dict):
+            pending_event = pending_slot.get(session_key)
+            if self._is_loop_continuation_event(pending_event):
+                pending_slot.pop(session_key, None)
+                removed += 1
+
+        queued_events = getattr(self, "_queued_events", None)
+        if isinstance(queued_events, dict):
+            overflow = queued_events.get(session_key) or []
+            if overflow:
+                kept = []
+                for queued_event in overflow:
+                    if self._is_loop_continuation_event(queued_event):
+                        removed += 1
+                    else:
+                        kept.append(queued_event)
+                if kept:
+                    queued_events[session_key] = kept
+                else:
+                    queued_events.pop(session_key, None)
+        return removed
+
+    def _loop_still_active_for_session(self, session_id: str) -> bool:
+        """Best-effort fresh DB check before running a queued loop continuation."""
+        if not session_id:
+            return False
+        try:
+            from hermes_cli.loop import LoopManager
+            return LoopManager(session_id=session_id).is_active()
+        except Exception as exc:
+            logger.debug("loop continuation: active-state recheck failed: %s", exc)
+            return False
+
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
@@ -6748,6 +6791,28 @@ class GatewayRunner:
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+
+            # Loop continuation: same pattern as goal, but timer-driven
+            try:
+                _final_text = ""
+                if isinstance(_agent_result, dict):
+                    _final_text = str(_agent_result.get("final_response") or "")
+                elif isinstance(_agent_result, str):
+                    _final_text = _agent_result
+                if _final_text.strip():
+                    try:
+                        session_entry = self.session_store.get_or_create_session(source)
+                    except Exception:
+                        session_entry = None
+                    if session_entry is not None:
+                        await self._post_turn_loop_continuation(
+                            session_entry=session_entry,
+                            source=source,
+                            final_response=_final_text,
+                        )
+            except Exception as _loop_exc:
+                logger.debug("loop continuation hook failed: %s", _loop_exc)
+
             return _agent_result
         finally:
             # If _run_agent replaced the sentinel with a real agent and
@@ -9450,6 +9515,26 @@ class GatewayRunner:
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
+    def _get_loop_manager_for_event(self, event: "MessageEvent"):
+        """Return a LoopManager bound to the session for this gateway event.
+
+        Returns ``(manager, session_entry)`` or ``(None, None)``.
+        """
+        try:
+            from hermes_cli.loop import LoopManager
+        except Exception as exc:
+            logger.debug("loop manager unavailable: %s", exc)
+            return None, None
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source)
+        except Exception as exc:
+            logger.debug("loop manager: session lookup failed: %s", exc)
+            return None, None
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return None, None
+        return LoopManager(session_id=sid), session_entry
+
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
 
@@ -9589,6 +9674,60 @@ class GatewayRunner:
 
         await _deliver()
 
+    async def _send_loop_status_notice(self, source: Any, message: str) -> None:
+        """Send a /loop status line back to the originating chat/thread."""
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.debug("loop continuation: no adapter for %s", getattr(source, "platform", None))
+            return
+
+        try:
+            metadata = self._thread_metadata_for_source(source)
+        except Exception:
+            metadata = None
+
+        result = await adapter.send(source.chat_id, message, metadata=metadata)
+        if result is not None and not getattr(result, "success", True):
+            logger.warning(
+                "loop continuation: status send failed: %s",
+                getattr(result, "error", "unknown error"),
+            )
+
+    async def _defer_loop_status_notice_after_delivery(self, source: Any, message: str) -> None:
+        """Send a /loop status line after the main response is delivered."""
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.debug("loop continuation: no adapter for %s", getattr(source, "platform", None))
+            return
+
+        async def _deliver() -> None:
+            try:
+                await self._send_loop_status_notice(source, message)
+            except Exception as exc:
+                logger.warning("loop continuation: status send failed: %s", exc, exc_info=True)
+
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = None
+
+        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+            try:
+                generation = None
+                active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                if active is not None:
+                    generation = getattr(active, "_hermes_run_generation", None)
+                adapter.register_post_delivery_callback(
+                    session_key,
+                    _deliver,
+                    generation=generation,
+                )
+                return
+            except Exception as exc:
+                logger.debug("loop continuation: post-delivery callback registration failed: %s", exc)
+
+        await _deliver()
+
     async def _post_turn_goal_continuation(
         self,
         *,
@@ -9657,6 +9796,67 @@ class GatewayRunner:
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    async def _post_turn_loop_continuation(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        final_response: str,
+    ) -> None:
+        """Run the loop evaluator after a gateway turn and, if active and
+        interval elapsed, enqueue a continuation prompt for the same session.
+        """
+        try:
+            from hermes_cli.loop import LoopManager
+        except Exception as exc:
+            logger.debug("loop continuation: loop module unavailable: %s", exc)
+            return
+
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return
+
+        # Goal takes priority
+        try:
+            from hermes_cli.goals import GoalManager
+            goal_mgr = GoalManager(session_id=sid, default_max_turns=self._goal_max_turns_from_config())
+            if goal_mgr.is_active():
+                return
+        except Exception:
+            pass
+
+        mgr = LoopManager(session_id=sid)
+        if not mgr.is_active():
+            return
+
+        decision = mgr.evaluate_after_turn(user_initiated=True)
+        msg = decision.get("message") or ""
+
+        if msg and source is not None:
+            await self._defer_loop_status_notice_after_delivery(source, msg)
+
+        if not decision.get("should_continue"):
+            return
+
+        prompt = decision.get("continuation_prompt") or ""
+        if not prompt or source is None:
+            return
+
+        try:
+            adapter = self.adapters.get(source.platform)
+            _quick_key = self._session_key_for_source(source)
+            if adapter and _quick_key:
+                cont_event = MessageEvent(
+                    text=prompt,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                self._enqueue_fifo(_quick_key, cont_event, adapter)
+        except Exception as exc:
+            logger.debug("loop continuation: enqueue failed: %s", exc)
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""
@@ -10314,119 +10514,96 @@ class GatewayRunner:
         return t("gateway.background.started", preview=preview, task_id=task_id)
 
     async def _handle_loop_command(self, event: MessageEvent) -> str:
-        """Handle /loop in gateway — thin wrapper around cronjob tool.
+        """Handle /loop for gateway platforms.
 
-        Creates a recurring cron job from a single slash command.
-        Subcommands: list, pause, resume, remove.
+        Subcommands: ``/loop`` / ``/loop status`` / ``/loop pause`` /
+        ``/loop resume`` / ``/loop clear``.  Any other text becomes the
+        new loop prompt.
         """
-        import json
-        import shlex
-        from tools.cronjob_tools import cronjob as cronjob_tool
-        from cron.jobs import get_job
+        args = (event.get_command_args() or "").strip()
+        lower = args.lower()
 
-        def _cron_api(**kwargs):
-            return json.loads(cronjob_tool(**kwargs))
+        mgr, session_entry = self._get_loop_manager_for_event(event)
+        if mgr is None:
+            return "Loop unavailable."
 
-        text = (event.text or "").strip()
-        # Strip leading "/loop" leaving args
-        if text.startswith("/"):
-            text = text.lstrip("/")
-        if text.startswith("loop"):
-            text = text[len("loop"):].lstrip()
+        if not args or lower == "status":
+            return mgr.status_line()
 
-        tokens = shlex.split(text)
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return "No loop set."
+            # Clear any pending loop continuations
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_loop_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("loop pause: pending continuation cleanup failed: %s", exc)
+            return f"⏸ Loop paused: {state.prompt}"
 
-        # No args → show usage + list
-        if not tokens:
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            lines = [
-                "*/loop <schedule> <prompt>* — e.g. `/loop 5m check deployment`",
-                "Subcommands: `list`, `pause <id>`, `resume <id>`, `remove <id>`",
-            ]
-            if loop_jobs:
-                lines.append("")
-                lines.append(f"*{len(loop_jobs)} loop job(s):*")
-                for job in loop_jobs:
-                    state_icon = "▶" if job.get("state") == "active" else "⏸"
-                    lines.append(f"  {state_icon} `{job['job_id'][:12]}` | {job['schedule']} | {job.get('prompt_preview', '')}")
-            else:
-                lines.append("No loop jobs. Create one with `/loop <schedule> <prompt>`.")
-            return "\n".join(lines)
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return "No loop to resume."
+            return f"▶ Loop resumed: {state.prompt}"
 
-        subcommand = tokens[0].lower()
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.is_active() or (mgr.state is not None)
+            mgr.clear()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_loop_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("loop clear: pending continuation cleanup failed: %s", exc)
+            return "✓ Loop cleared." if had else "No active loop."
 
-        # list
-        if subcommand == "list":
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            if not loop_jobs:
-                return "No loop jobs found."
-            lines = ["*Loop Jobs:*"]
-            for job in loop_jobs:
-                lines.append(f"• `{job['job_id']}` | {job['schedule']} | {job.get('state', '?')} | {job.get('prompt_preview', '')}")
-            return "\n".join(lines)
-
-        # pause
-        if subcommand == "pause":
-            if len(tokens) < 2:
-                return "Usage: `/loop pause <job_id>`"
-            job_id = tokens[1]
-            result = _cron_api(action="pause", job_id=job_id, reason="paused from /loop")
-            if result.get("success"):
-                return f"⏸ Paused loop job `{job_id}`"
-            return f"⚠ Failed to pause: {result.get('error')}"
-
-        # resume
-        if subcommand == "resume":
-            if len(tokens) < 2:
-                return "Usage: `/loop resume <job_id>`"
-            job_id = tokens[1]
-            result = _cron_api(action="resume", job_id=job_id)
-            if result.get("success"):
-                return f"▶ Resumed loop job `{job_id}` — next run: {result['job'].get('next_run_at', 'N/A')}"
-            return f"⚠ Failed to resume: {result.get('error')}"
-
-        # remove
-        if subcommand == "remove":
-            if len(tokens) < 2:
-                return "Usage: `/loop remove <job_id>`"
-            job_id = tokens[1]
-            result = _cron_api(action="remove", job_id=job_id)
-            if result.get("success"):
-                return f"🗑 Removed loop job `{job_id}`"
-            return f"⚠ Failed to remove: {result.get('error')}"
-
-        # Create: /loop <schedule> <prompt>
-        # Handle "every 5m" syntax where "every" + next token form the schedule
-        if tokens[0].lower() == "every" and len(tokens) > 1:
-            schedule = f"every {tokens[1]}"
-            prompt = " ".join(tokens[2:]) if len(tokens) > 2 else ""
-        else:
-            schedule = tokens[0]
-            prompt = " ".join(tokens[1:]) if len(tokens) > 1 else ""
+        # Parse optional interval prefix
+        interval_seconds = 300
+        prompt = args
+        tokens = args.split(None, 2)
+        if len(tokens) >= 2 and tokens[0].lower() == "every":
+            from hermes_cli.loop import _parse_interval
+            parsed = _parse_interval(tokens[1])
+            if parsed is not None:
+                interval_seconds = parsed
+                prompt = tokens[2] if len(tokens) > 2 else ""
+        elif len(tokens) >= 1:
+            from hermes_cli.loop import _parse_interval
+            parsed = _parse_interval(tokens[0])
+            if parsed is not None:
+                interval_seconds = parsed
+                prompt = " ".join(tokens[1:]) if len(tokens) > 1 else ""
 
         if not prompt:
-            return "Usage: `/loop <schedule> <prompt>`\nExample: `/loop 5m check deployment`"
+            return "Usage: `/loop <prompt>` or `/loop <interval> <prompt>`"
 
-        name = f"loop: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
-        result = _cron_api(
-            action="create",
-            schedule=schedule,
-            prompt=prompt,
-            name=name,
-            deliver="origin",
-        )
-        if result.get("success"):
-            return (
-                f"✅ Loop job created: `{result['job_id']}`\n"
-                f"Schedule: {result['schedule']}\n"
-                f"Next run: {result['next_run_at']}\n"
-                f"To stop: `/loop remove {result['job_id']}`"
-            )
-        return f"⚠ Failed to create loop: {result.get('error')}"
+        try:
+            state = mgr.set(prompt, interval_seconds=interval_seconds)
+        except ValueError as exc:
+            return f"Invalid loop: {exc}"
+
+        # Queue the prompt as an immediate first turn
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        _quick_key = self._session_key_for_source(event.source) if event.source else None
+        if adapter and _quick_key:
+            try:
+                kickoff_event = MessageEvent(
+                    text=prompt,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+            except Exception as exc:
+                logger.debug("loop kickoff enqueue failed: %s", exc)
+
+        return f"⊙ Loop set ({interval_seconds}s interval): {state.prompt}"
 
     async def _run_background_task(
         self,
@@ -16220,6 +16397,12 @@ class GatewayRunner:
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
+                            session_key or "?",
+                        )
+                        return result
+                    if self._is_loop_continuation_event(pending_event) and not self._loop_still_active_for_session(session_id):
+                        logger.info(
+                            "Discarding stale loop continuation for session %s — loop is no longer active",
                             session_key or "?",
                         )
                         return result

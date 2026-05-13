@@ -7222,171 +7222,90 @@ class HermesCLI:
         print(f"(._.) Unknown cron command: {subcommand}")
         print("  Available: list, add, edit, pause, resume, run, remove")
 
-    def _handle_loop_command(self, cmd: str):
-        """Handle /loop <schedule> <prompt> — thin wrapper around cronjob tool.
+    def _handle_loop_command(self, cmd: str) -> None:
+        """Dispatch /loop subcommands: set / status / pause / resume / clear."""
+        parts = (cmd or "").strip().split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
 
-        Creates a recurring cron job from natural language input.
-        Subcommands: list, pause, resume, remove.
-        """
-        import json
-        import shlex
-        from tools.cronjob_tools import cronjob as cronjob_tool
-        from cron.jobs import get_job
+        mgr = self._get_loop_manager()
+        if mgr is None:
+            _cprint(f"  {_DIM}Loop unavailable (no active session).{_RST}")
+            return
 
-        def _cron_api(**kwargs):
-            return json.loads(cronjob_tool(**kwargs))
+        lower = arg.lower()
 
-        tokens = shlex.split(cmd)
+        # Bare /loop or /loop status → show current state
+        if not arg or lower == "status":
+            _cprint(f"  {mgr.status_line()}")
+            return
 
-        # No args → show usage + list
-        if len(tokens) == 1:
-            print()
-            print("+" + "-" * 68 + "+")
-            print("|" + " " * 22 + "(^_^) /loop — Scheduled Prompts" + " " * 23 + "|")
-            print("+" + "-" * 68 + "+")
-            print()
-            print("  Usage:")
-            print('    /loop <schedule> <prompt>     e.g. /loop 5m "check deployment"')
-            print('    /loop list                    Show all loop jobs')
-            print('    /loop pause <job_id>          Pause a loop job')
-            print('    /loop resume <job_id>         Resume a paused loop job')
-            print('    /loop remove <job_id>         Delete a loop job')
-            print()
-            print("  Schedules:  5m, 30m, 2h, 1d, every 5m, every 2h, 0 9 * * *")
-            print()
-
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            if loop_jobs:
-                print("  Loop Jobs:")
-                print("  " + "-" * 63)
-                for job in loop_jobs:
-                    state = job.get("state", "?")
-                    state_icon = "▶" if state == "active" else "⏸"
-                    print(f"    {state_icon} {job['job_id'][:12]:<12} | {job['schedule']:<15} | {job.get('repeat', 'forever')}")
-                    print(f"      {job.get('prompt_preview', '')}")
-                    if job.get("next_run_at"):
-                        print(f"      Next: {job['next_run_at']}")
-                    print()
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                _cprint(f"  {_DIM}No loop set.{_RST}")
             else:
-                print("  No loop jobs. Use '/loop <schedule> <prompt>' to create one.")
-            print()
+                _cprint(f"  ⏸ Loop paused: {state.prompt}")
             return
 
-        subcommand = tokens[1].lower()
-
-        # /loop list
-        if subcommand == "list":
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            if not loop_jobs:
-                print("(._.) No loop jobs found.")
-                return
-            print()
-            print("Loop Jobs:")
-            print("-" * 80)
-            for job in loop_jobs:
-                print(f"  ID: {job['job_id']}")
-                print(f"  Name: {job['name']}")
-                print(f"  State: {job.get('state', '?')}")
-                print(f"  Schedule: {job['schedule']} ({job.get('repeat', '?')})")
-                print(f"  Next run: {job.get('next_run_at', 'N/A')}")
-                print(f"  Prompt: {job.get('prompt_preview', '')}")
-                if job.get("last_run_at"):
-                    print(f"  Last run: {job['last_run_at']} ({job.get('last_status', '?')})")
-                print()
-            return
-
-        # /loop pause <job_id>
-        if subcommand == "pause":
-            if len(tokens) < 3:
-                print("(._.) Usage: /loop pause <job_id>")
-                return
-            job_id = tokens[2]
-            result = _cron_api(action="pause", job_id=job_id, reason="paused from /loop")
-            if result.get("success"):
-                print(f"(^_^)b Paused loop job: {result['job']['name']} ({job_id})")
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                _cprint(f"  {_DIM}No loop to resume.{_RST}")
             else:
-                print(f"(x_x) Failed to pause: {result.get('error')}")
+                _cprint(f"  ▶ Loop resumed: {state.prompt}")
             return
 
-        # /loop resume <job_id>
-        if subcommand == "resume":
-            if len(tokens) < 3:
-                print("(._.) Usage: /loop resume <job_id>")
-                return
-            job_id = tokens[2]
-            result = _cron_api(action="resume", job_id=job_id)
-            if result.get("success"):
-                print(f"(^_^)b Resumed loop job: {result['job']['name']} ({job_id})")
-                print(f"  Next run: {result['job'].get('next_run_at')}")
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.is_active() or (mgr.state is not None)
+            mgr.clear()
+            if had:
+                _cprint("  ✓ Loop cleared.")
             else:
-                print(f"(x_x) Failed to resume: {result.get('error')}")
+                _cprint(f"  {_DIM}No active loop.{_RST}")
             return
 
-        # /loop remove <job_id>
-        if subcommand == "remove":
-            if len(tokens) < 3:
-                print("(._.) Usage: /loop remove <job_id>")
-                return
-            job_id = tokens[2]
-            result = _cron_api(action="remove", job_id=job_id)
-            if result.get("success"):
-                print(f"(^_^)b Removed loop job: {result.get('removed_job', {}).get('name', job_id)}")
-            else:
-                print(f"(x_x) Failed to remove: {result.get('error')}")
-            return
+        # Otherwise treat the arg as the loop prompt.
+        # Parse optional interval prefix: "5m <prompt>" or "every 5m <prompt>"
+        interval_seconds = 300  # default 5 minutes
+        prompt = arg
 
-        # /loop <schedule> <prompt>  (create)
-        # Try to parse: first token is schedule, rest is prompt
-        # Handle "every 5m" syntax where "every" + next token form the schedule
-        if tokens[1].lower() == "every" and len(tokens) > 2:
-            schedule = f"every {tokens[2]}"
-            prompt = " ".join(tokens[3:]) if len(tokens) > 3 else ""
-        else:
-            schedule = tokens[1]
-            prompt = " ".join(tokens[2:]) if len(tokens) > 2 else ""
+        tokens = arg.split(None, 2)
+        if len(tokens) >= 2 and tokens[0].lower() == "every":
+            # "every 5m check deployment" → interval=5m, prompt="check deployment"
+            from hermes_cli.loop import _parse_interval
+            parsed_interval = _parse_interval(tokens[1])
+            if parsed_interval is not None:
+                interval_seconds = parsed_interval
+                prompt = tokens[2] if len(tokens) > 2 else ""
+        elif len(tokens) >= 1:
+            from hermes_cli.loop import _parse_interval
+            parsed_interval = _parse_interval(tokens[0])
+            if parsed_interval is not None:
+                interval_seconds = parsed_interval
+                prompt = " ".join(tokens[1:]) if len(tokens) > 1 else ""
 
         if not prompt:
-            print("(._.) Usage: /loop <schedule> <prompt>")
-            print('  Example: /loop 5m "check deployment status"')
-            print('  Example: /loop every 30m "summarize news"')
+            _cprint("  (._.) Usage: /loop <prompt>")
+            _cprint("  Or: /loop <interval> <prompt>  e.g. /loop 5m check deployment")
+            _cprint("  Subcommands: status, pause, resume, clear")
             return
 
-        # Warn if interval looks very short
-        from cron.jobs import parse_duration
         try:
-            minutes = parse_duration(schedule.lstrip("every "))
-            if minutes < 1:
-                print("⚠ Interval is very short (< 1 minute). The scheduler ticks every 60s, so this may not fire as expected.")
-        except Exception:
-            pass  # Not a simple duration — could be cron expr or "every X" form
+            state = mgr.set(prompt, interval_seconds=interval_seconds)
+        except ValueError as exc:
+            _cprint(f"  Invalid loop: {exc}")
+            return
 
-        # Check if gateway is running (best-effort)
+        _cprint(f"  ⊙ Loop set ({state.interval_seconds}s interval, {mgr.default_max_turns}-turn budget): {state.prompt}")
+        _cprint(
+            f"  {_DIM}After each turn, if {state.interval_seconds}s have elapsed, "
+            f"the prompt will repeat. Use /loop status, /loop pause, /loop resume, /loop clear.{_RST}"
+        )
+        # Kick off immediately so the user doesn't have to send a separate message
         try:
-            from hermes_cli.cron import _is_gateway_running
-            if not _is_gateway_running():
-                print("⚠ No gateway is running. The job will be scheduled but will not execute until a gateway starts.")
+            self._pending_input.put(state.prompt)
         except Exception:
             pass
-
-        name = f"loop: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
-        result = _cron_api(
-            action="create",
-            schedule=schedule,
-            prompt=prompt,
-            name=name,
-            deliver="origin",
-        )
-        if result.get("success"):
-            print(f"(^_^)b Loop job created: {result['job_id']}")
-            print(f"  Schedule: {result['schedule']}")
-            print(f"  Next run: {result['next_run_at']}")
-            print(f"  To stop: /loop remove {result['job_id']}")
-        else:
-            print(f"(x_x) Failed to create loop: {result.get('error')}")
 
     def _handle_curator_command(self, cmd: str):
         """Handle /curator slash command.
@@ -7840,8 +7759,6 @@ class HermesCLI:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            # shell=True is intentional: quick_commands are user-defined
-                            # shell snippets from config.yaml — not agent/LLM controlled.
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
                                 text=True, timeout=30
@@ -8355,6 +8272,30 @@ class HermesCLI:
         self._goal_manager = mgr
         return mgr
 
+    def _get_loop_manager(self):
+        """Return the LoopManager bound to the current session_id.
+
+        Cached on ``self._loop_manager`` and rebound lazily when
+        ``session_id`` changes.
+        """
+        try:
+            from hermes_cli.loop import LoopManager
+        except Exception as exc:
+            logging.debug("loop manager unavailable: %s", exc)
+            return None
+
+        sid = getattr(self, "session_id", None) or ""
+        if not sid:
+            return None
+
+        existing = getattr(self, "_loop_manager", None)
+        if existing is not None and getattr(existing, "session_id", None) == sid:
+            return existing
+
+        mgr = LoopManager(session_id=sid)
+        self._loop_manager = mgr
+        return mgr
+
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / status / pause / resume / clear."""
         parts = (cmd or "").strip().split(None, 1)
@@ -8510,6 +8451,84 @@ class HermesCLI:
                     self._pending_input.put(prompt)
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
+
+    def _maybe_continue_loop_after_turn(self) -> None:
+        """Hook run after every CLI turn.  If a loop is active and the
+        interval has elapsed, re-queue the prompt.
+
+        Same preemption rules as /goal:
+        - Skip if real user message already in _pending_input
+        - Skip if turn was interrupted (Ctrl+C)
+        - Skip on empty responses
+        - Goal takes priority over loop (check goal first)
+        """
+        # Goal takes priority — if goal is active, let it drive
+        try:
+            goal_mgr = self._get_goal_manager()
+            if goal_mgr is not None and goal_mgr.is_active():
+                return
+        except Exception:
+            pass
+
+        mgr = self._get_loop_manager()
+        if mgr is None or not mgr.is_active():
+            return
+
+        # Preemption: real user message queued
+        try:
+            if getattr(self, "_pending_input", None) is not None \
+                    and not self._pending_input.empty():
+                return
+        except Exception:
+            pass
+
+        # Interrupt guard
+        if getattr(self, "_last_turn_interrupted", False):
+            try:
+                mgr.pause(reason="user-interrupted (Ctrl+C)")
+            except Exception as exc:
+                logging.debug("loop pause-on-interrupt failed: %s", exc)
+            _cprint(
+                f"  {_DIM}⏸ Loop paused — turn was interrupted. "
+                f"Use /loop resume to continue, or /loop clear to stop.{_RST}"
+            )
+            return
+
+        # Empty response guard
+        last_response = ""
+        try:
+            hist = self.conversation_history or []
+            for msg in reversed(hist):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        parts = [
+                            p.get("text", "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") in {"text", "output_text"}
+                        ]
+                        last_response = "\n".join(t for t in parts if t)
+                    else:
+                        last_response = str(content or "")
+                    break
+        except Exception:
+            last_response = ""
+
+        if not last_response.strip():
+            return
+
+        decision = mgr.evaluate_after_turn(user_initiated=True)
+        msg = decision.get("message") or ""
+        if msg:
+            _cprint(f"  {msg}")
+
+        if decision.get("should_continue"):
+            prompt = decision.get("continuation_prompt")
+            if prompt:
+                try:
+                    self._pending_input.put(prompt)
+                except Exception as exc:
+                    logging.debug("loop continuation enqueue failed: %s", exc)
 
     def _handle_skin_command(self, cmd: str):
         """Handle /skin [name] — show or change the display skin."""
@@ -13241,6 +13260,11 @@ class HermesCLI:
                             self._maybe_continue_goal_after_turn()
                         except Exception as _goal_exc:
                             logging.debug("goal continuation hook failed: %s", _goal_exc)
+
+                        try:
+                            self._maybe_continue_loop_after_turn()
+                        except Exception as _loop_exc:
+                            logging.debug("loop continuation hook failed: %s", _loop_exc)
 
                         # Continuous voice: auto-restart recording after agent responds.
                         # Dispatch to a daemon thread so play_beep (sd.wait) and

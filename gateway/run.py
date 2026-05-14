@@ -9787,6 +9787,128 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    async def _handle_loop_command(self, event: MessageEvent) -> str:
+        """Handle /loop for gateway platforms.
+
+        Subcommands: ``/loop`` / ``/loop status`` / ``/loop pause`` /
+        ``/loop resume`` / ``/loop clear``.  Any other text becomes the
+        new loop prompt.
+        """
+        args = (event.get_command_args() or "").strip()
+        lower = args.lower()
+
+        mgr, session_entry = self._get_loop_manager_for_event(event)
+        if mgr is None:
+            return "Loop unavailable."
+
+        if not args or lower == "status":
+            return mgr.status_line()
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return "No loop set."
+            # Clear any pending loop continuations
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_loop_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("loop pause: pending continuation cleanup failed: %s", exc)
+            return f"⏸ Loop paused: {state.prompt}"
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return "No loop to resume."
+            return f"▶ Loop resumed: {state.prompt}"
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.is_active() or (mgr.state is not None)
+            mgr.clear()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_loop_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("loop clear: pending continuation cleanup failed: %s", exc)
+            return "✓ Loop cleared." if had else "No active loop."
+
+        # Parse optional interval prefix
+        interval_seconds = 300
+        prompt = args
+        tokens = args.split(None, 2)
+        if len(tokens) >= 2 and tokens[0].lower() == "every":
+            from hermes_cli.loop import _parse_interval
+            parsed = _parse_interval(tokens[1])
+            if parsed is not None:
+                interval_seconds = parsed
+                prompt = tokens[2] if len(tokens) > 2 else ""
+        elif len(tokens) >= 1:
+            from hermes_cli.loop import _parse_interval
+            parsed = _parse_interval(tokens[0])
+            if parsed is not None:
+                interval_seconds = parsed
+                prompt = " ".join(tokens[1:]) if len(tokens) > 1 else ""
+
+        if not prompt:
+            return "Usage: `/loop <prompt>` or `/loop <interval> <prompt>`"
+
+        try:
+            state = mgr.set(prompt, interval_seconds=interval_seconds)
+        except ValueError as exc:
+            return f"Invalid loop: {exc}"
+
+        # Start background daemon ticker and fire immediate kickoff
+        session_entry = self.session_store.get_or_create_session(event.source)
+        sid = session_entry.session_id if session_entry else None
+
+        if sid:
+            from hermes_cli.loop import load_loop, save_loop
+            import time as _t
+            import threading
+
+            def _loop_ticker() -> None:
+                """Background daemon that ticks every second."""
+                while True:
+                    _t.sleep(1)
+                    s = load_loop(sid)
+                    if s is None or s.status != "active":
+                        break
+                    now = _t.time()
+                    elapsed = now - s.last_fired_at
+                    if s.last_fired_at > 0 and elapsed < s.interval_seconds:
+                        continue
+                    s.last_fired_at = now
+                    s.turns_completed += 1
+                    save_loop(sid, s)
+                    try:
+                        self._dispatch_loop_prompt(
+                            prompt=s.prompt,
+                            source=event.source,
+                        )
+                    except Exception:
+                        pass
+
+            threading.Thread(
+                target=_loop_ticker,
+                name=f"loop-ticker-{sid[:8]}",
+                daemon=True,
+            ).start()
+
+            # Fire the first tick immediately
+            try:
+                self._dispatch_loop_prompt(
+                    prompt=prompt,
+                    source=event.source,
+                )
+            except Exception as exc:
+                logger.debug("loop kickoff dispatch failed: %s", exc)
+
+        return f"⊙ Loop set ({state.interval_seconds}s interval): {state.prompt}"
+
     async def _run_background_task(
         self,
         prompt: str,

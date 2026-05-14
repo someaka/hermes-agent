@@ -5296,7 +5296,7 @@ def _(rid, params: dict) -> dict:
             )
             return _ok(
                 rid,
-                {"type": "send", "notice": notice, "message": state.prompt},
+                {"type": "exec", "output": notice},
             )
 
     if name in {"snapshot", "snap"}:

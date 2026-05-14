@@ -409,16 +409,33 @@ class LoopManager:
         return self._scheduler is not None and self._scheduler.running
 
     def status_line(self) -> str:
-        """Multi-line status listing all loops with UIDs."""
+        """Multi-line status listing all loops with UIDs and countdown."""
         if not self._states:
             return "No active loops. Set one with /loop [interval] <prompt>."
         lines = []
+        now = time.time()
         running = "running" if self.is_running() else "stopped"
         for uid, s in sorted(self._states.items()):
             turns = f"{s.turns_completed}/{self.default_max_turns} turns"
             if s.status == "active":
+                # Compute time remaining until next tick
+                if s.last_fired_at <= 0:
+                    next_str = "next: now"
+                else:
+                    remaining = int((s.last_fired_at + s.interval_seconds) - now)
+                    if remaining <= 0:
+                        next_str = "next: now"
+                    elif remaining < 60:
+                        next_str = f"next: {remaining}s"
+                    elif remaining < 3600:
+                        m, sec = divmod(remaining, 60)
+                        next_str = f"next: {m}m {sec}s"
+                    else:
+                        h, rem = divmod(remaining, 3600)
+                        m, sec = divmod(rem, 60)
+                        next_str = f"next: {h}h {m}m"
                 lines.append(f"⊙ Loop #{uid} (active, {running}, "
-                             f"{s.interval_seconds}s, {turns}): {s.prompt}")
+                             f"{s.interval_seconds}s, {next_str}, {turns}): {s.prompt}")
             elif s.status == "paused":
                 lines.append(f"⏸ Loop #{uid} (paused, "
                              f"{s.interval_seconds}s, {turns}): {s.prompt}")

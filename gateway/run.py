@@ -9876,26 +9876,13 @@ class GatewayRunner:
         state.turns_completed += 1
         save_loop(sid, state)
 
-        adapter = (
-            self.adapters.get(source.platform)
-            if source else None
-        )
-        _quick_key = (
-            self._session_key_for_source(source)
-            if source else None
-        )
-        if adapter and _quick_key:
-            try:
-                kickoff_event = MessageEvent(
-                    text=state.prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
-            except Exception as exc:
-                logger.debug("loop continuation enqueue failed: %s", exc)
+        try:
+            self._dispatch_loop_prompt(
+                prompt=state.prompt,
+                source=source,
+            )
+        except Exception as exc:
+            logger.debug("loop continuation dispatch failed: %s", exc)
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""

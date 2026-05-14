@@ -10626,23 +10626,53 @@ class GatewayRunner:
         except ValueError as exc:
             return f"Invalid loop: {exc}"
 
-        # Queue the prompt as an immediate first turn
-        adapter = self.adapters.get(event.source.platform) if event.source else None
-        _quick_key = self._session_key_for_source(event.source) if event.source else None
-        if adapter and _quick_key:
-            try:
-                kickoff_event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
-            except Exception as exc:
-                logger.debug("loop kickoff enqueue failed: %s", exc)
+        # Start background daemon ticker and fire immediate kickoff
+        session_entry = self.session_store.get_or_create_session(event.source)
+        sid = session_entry.session_id if session_entry else None
 
-        return f"⊙ Loop set ({interval_seconds}s interval): {state.prompt}"
+        if sid:
+            from hermes_cli.loop import load_loop, save_loop
+            import time as _t
+            import threading
+
+            def _loop_ticker() -> None:
+                """Background daemon that ticks every second."""
+                while True:
+                    _t.sleep(1)
+                    s = load_loop(sid)
+                    if s is None or s.status != "active":
+                        break
+                    now = _t.time()
+                    elapsed = now - s.last_fired_at
+                    if s.last_fired_at > 0 and elapsed < s.interval_seconds:
+                        continue
+                    s.last_fired_at = now
+                    s.turns_completed += 1
+                    save_loop(sid, s)
+                    try:
+                        self._dispatch_loop_prompt(
+                            prompt=s.prompt,
+                            source=event.source,
+                        )
+                    except Exception:
+                        pass
+
+            threading.Thread(
+                target=_loop_ticker,
+                name=f"loop-ticker-{sid[:8]}",
+                daemon=True,
+            ).start()
+
+            # Fire the first tick immediately
+            try:
+                self._dispatch_loop_prompt(
+                    prompt=prompt,
+                    source=event.source,
+                )
+            except Exception as exc:
+                logger.debug("loop kickoff dispatch failed: %s", exc)
+
+        return f"⊙ Loop set ({state.interval_seconds}s interval): {state.prompt}"
 
     async def _run_background_task(
         self,

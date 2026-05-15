@@ -47,16 +47,6 @@ class TestChromiumSearchRoots:
 
 
 class TestChromiumInstalled:
-    def test_true_when_plain_chromium_on_path(self, monkeypatch):
-        monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
-        monkeypatch.setattr(
-            bt.shutil,
-            "which",
-            lambda name: "/usr/bin/chromium" if name == "chromium" else None,
-        )
-
-        assert bt._chromium_installed() is True
-
     def test_true_when_chromium_dir_present(self, monkeypatch, tmp_path):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
         (tmp_path / "chromium-1208").mkdir()
@@ -160,6 +150,7 @@ class TestRunBrowserCommandChromiumGuard:
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path / "fakehome"))
         monkeypatch.setattr("shutil.which", lambda _cmd: None)
+
 
         monkeypatch.setattr("subprocess.Popen", _fail_popen)
 

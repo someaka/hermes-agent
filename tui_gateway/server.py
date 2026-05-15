@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -594,6 +594,19 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 info["config_warning"] = cfg_warn
                 logger.warning(cfg_warn)
             _emit("session.info", sid, info)
+            # Ensure loop manager for this session (idempotent).
+            # The slash_worker persisted state to SessionDB; this
+            # LoopManager with TUI dispatch picks up the ticking.
+            if "_loop_manager" not in current:
+                try:
+                    from hermes_cli.loop import LoopManager
+                    lk = current.get("session_key") or sid
+                    current["_loop_manager"] = LoopManager(
+                        session_id=lk,
+                        dispatch=_make_tui_dispatch(current, sid),
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
@@ -614,6 +627,28 @@ def _start_agent_build(sid: str, session: dict) -> None:
             ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
+
+
+def _make_tui_dispatch(session: dict, sid: str) -> Callable[[str], bool]:
+    """Return a dispatch callback that injects loop prompts via _run_prompt_submit.
+
+    The callback returns True if the prompt was submitted, False if the
+    session is busy and the ticker should retry next tick.
+    """
+    def _dispatch(prompt: str) -> bool:
+        with session["history_lock"]:
+            if session.get("running"):
+                return False
+            session["running"] = True
+        try:
+            _emit("message.start", sid)
+            _run_prompt_submit(None, sid, session, prompt)
+            return True
+        except Exception:
+            with session["history_lock"]:
+                session["running"] = False
+            return False
+    return _dispatch
 
 
 def _sess_nowait(params, rid):
@@ -4397,6 +4432,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "plan",
         "goal",
+        "loop",
     }
 )
 
@@ -4781,6 +4817,90 @@ def _(rid, params: dict) -> dict:
             rid,
             {"type": "send", "notice": notice, "message": state.goal},
         )
+
+    if name == "loop":
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.loop import LoopManager, _parse_loop_command
+        except Exception as exc:
+            return _err(rid, 5030, f"loop unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        # Use the session's existing loop manager (with TUI dispatch)
+        # or create one if it doesn't exist yet.
+        mgr = session.get("_loop_manager")
+        if mgr is None or getattr(mgr, "session_id", None) != sid_key:
+            mgr = LoopManager(
+                session_id=sid_key,
+                dispatch=_make_tui_dispatch(session, params.get("session_id", "")),
+            )
+            session["_loop_manager"] = mgr
+
+        parsed = _parse_loop_command(arg)
+        action = parsed["action"]
+
+        if action == "status":
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+
+        if action == "pause_all":
+            paused = mgr.pause()
+            if not paused:
+                return _ok(rid, {"type": "exec", "output": "No active loops."})
+            ids = ", ".join(f"#{s.id}" for s in paused)
+            return _ok(rid, {"type": "exec", "output": f"⏸ Paused: {ids}"})
+
+        if action == "pause":
+            paused = mgr.pause(uid=parsed["uid"])
+            if not paused:
+                return _ok(rid, {"type": "exec", "output": f"No loop #{parsed['uid']}."})
+            return _ok(rid, {"type": "exec", "output": f"⏸ Loop #{parsed['uid']} paused: {paused[0].prompt}"})
+
+        if action == "resume_all":
+            resumed = mgr.resume()
+            if not resumed:
+                return _ok(rid, {"type": "exec", "output": "No paused loops."})
+            ids = ", ".join(f"#{s.id}" for s in resumed)
+            return _ok(rid, {"type": "exec", "output": f"▶ Resumed: {ids}"})
+
+        if action == "resume":
+            resumed = mgr.resume(uid=parsed["uid"])
+            if not resumed:
+                return _ok(rid, {"type": "exec", "output": f"No loop #{parsed['uid']}."})
+            return _ok(rid, {"type": "exec", "output": f"▶ Loop #{parsed['uid']} resumed: {resumed[0].prompt}"})
+
+        if action == "clear_all":
+            count = mgr.clear()
+            if count:
+                return _ok(rid, {"type": "exec", "output": f"✓ {count} loop(s) cleared."})
+            return _ok(rid, {"type": "exec", "output": "No active loops."})
+
+        if action == "clear":
+            count = mgr.clear(uid=parsed["uid"])
+            if count:
+                return _ok(rid, {"type": "exec", "output": f"✓ Loop #{parsed['uid']} cleared."})
+            return _ok(rid, {"type": "exec", "output": f"No loop #{parsed['uid']}."})
+
+        if action == "set":
+            try:
+                state = mgr.add(
+                    parsed["prompt"],
+                    interval_seconds=parsed["interval"],
+                )
+            except ValueError as exc:
+                return _err(rid, 4004, f"invalid loop: {exc}")
+
+            notice = (
+                f"⊙ Loop #{state.id} set: every {state.interval_seconds}s → {state.prompt}\n"
+                "Controls: /loop list · /loop status · /loop pause · /loop resume · /loop clear"
+            )
+            return _ok(
+                rid,
+                {"type": "exec", "output": notice},
+            )
 
     if name in {"snapshot", "snap"}:
         subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""

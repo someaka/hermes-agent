@@ -2,17 +2,17 @@
 
 Memory providers give the agent persistent recall across sessions. One or
 more external providers can be active simultaneously alongside the always-on
-built-in memory (MEMORY.md / USER.md). The ``memory.providers`` list in
+built-in memory (MEMORY.md / USER.md). The memory.providers list in
 config.yaml controls which external providers are loaded.
 
 Built-in memory is always active as the first provider and cannot be removed.
 External providers (Honcho, Hindsight, Mem0, etc.) are additive — they never
 disable the built-in store.  Multiple external providers can run
-simultaneously via the ``memory.providers`` list in config.yaml.
+simultaneously via the memory.providers list in config.yaml.
 
 Registration:
   Plugins ship in plugins/memory/<name>/ and are activated via
-  the memory.provider config key.
+  the memory.providers config key.
 
 Lifecycle (called by MemoryManager, wired in run_agent.py):
   initialize()          — connect, create resources, warm up

@@ -3067,6 +3067,56 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
+def _poll_kanban_for_tui(sid: str, session: dict) -> None:
+    """Poll kanban task_events for CLI-subscribed tasks and emit status updates."""
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect()
+        try:
+            subs = _kb.list_notify_subs(conn)
+            for sub in subs:
+                if sub.get("platform") != "cli":
+                    continue
+                _, events = _kb.unseen_events_for_sub(
+                    conn, task_id=sub["task_id"], platform="cli",
+                    chat_id=sub["chat_id"], thread_id=sub.get("thread_id") or "",
+                    kinds=("completed", "blocked", "gave_up", "crashed", "timed_out"),
+                )
+                if events:
+                    max_id = max(e.id if hasattr(e, "id") else e.get("id", 0) for e in events)
+                    try:
+                        _kb.advance_notify_cursor(conn, sub["task_id"], "cli",
+                            sub["chat_id"], sub.get("thread_id") or "", max_id)
+                    except Exception:
+                        pass
+                    for ev in events:
+                        text = None
+                        kind = ev.kind if hasattr(ev, "kind") else ev.get("kind")
+                        task_id = sub["task_id"]
+                        payload = ev.payload if hasattr(ev, "payload") else ev.get("payload", {})
+                        if kind == "blocked" and payload and payload.get("reason"):
+                            reason = str(payload["reason"])[:160]
+                            text = f"[KANBAN] Task {task_id} blocked: {reason}"
+                        elif kind == "completed" and payload and payload.get("summary"):
+                            summ = str(payload["summary"]).strip().splitlines()[0][:200]
+                            text = f"[KANBAN] Task {task_id} done: {summ}"
+                        elif kind == "crashed":
+                            text = f"[KANBAN] Task {task_id} worker crashed; retrying"
+                        elif kind == "timed_out":
+                            limit = int(payload.get("limit_seconds", 0)) if payload else 0
+                            text = f"[KANBAN] Task {task_id} timed out (max_runtime={limit}s)"
+                        elif kind == "gave_up" and payload and payload.get("error"):
+                            err = str(payload["error"])[:200]
+                            text = f"[KANBAN] Task {task_id} gave up: {err}"
+                        if text:
+                            _emit("status.update", sid, {"kind": "process", "text": text})
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Non-fatal — don't break the notification poller
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -3087,6 +3137,8 @@ def _notification_poller_loop(
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
+            # No process event — check kanban instead
+            _poll_kanban_for_tui(sid, session)
             continue
 
         _evt_sid = evt.get("session_id", "")

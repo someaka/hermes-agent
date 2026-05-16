@@ -29,6 +29,7 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import re
 import inspect
@@ -205,6 +206,7 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._lock = threading.RLock()
+        self._provider_health: Dict[str, Dict[str, Any]] = {}
 
     # -- Registration --------------------------------------------------------
 
@@ -309,6 +311,73 @@ class MemoryManager:
             logger.warning("Provider '%s' not found for removal", name)
             return False
 
+    # -- Health tracking -----------------------------------------------------
+
+    def _record_provider_success(self, name: str) -> None:
+        """Reset failure count for a provider after a successful call."""
+        with self._lock:
+            if name in self._provider_health:
+                self._provider_health[name]["failures"] = 0
+                self._provider_health[name]["healthy"] = True
+                self._provider_health[name]["last_error"] = None
+
+    def _record_provider_failure(self, name: str, error: Exception) -> None:
+        """Increment failure count for a provider; mark unhealthy after 3."""
+        with self._lock:
+            health = self._provider_health.setdefault(
+                name, {"healthy": True, "failures": 0, "last_error": None}
+            )
+            health["failures"] += 1
+            health["last_error"] = str(error)
+            if health["failures"] >= 3:
+                health["healthy"] = False
+                logger.warning(
+                    "Memory provider '%s' marked UNHEALTHY after %d consecutive failures (%s). "
+                    "Skipping until recovery.",
+                    name, health["failures"], health["last_error"],
+                )
+
+    def _is_provider_healthy(self, name: str) -> bool:
+        """Check if a provider is healthy (fewer than 3 consecutive failures)."""
+        with self._lock:
+            health = self._provider_health.get(name)
+            if health is None:
+                return True
+            return health.get("healthy", True)
+
+    def _call_with_timeout(
+        self,
+        provider: MemoryProvider,
+        method_name: str,
+        timeout: float = 30.0,
+        *args,
+        **kwargs,
+    ) -> Any:
+        """Call a provider method with a timeout using ThreadPoolExecutor.
+
+        Returns the method result, or raises TimeoutError on timeout.
+        Also records success/failure for health tracking.
+        """
+        method = getattr(provider, method_name)
+
+        def _run() -> Any:
+            return method(*args, **kwargs)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run)
+            try:
+                result = future.result(timeout=timeout)
+                self._record_provider_success(provider.name)
+                return result
+            except concurrent.futures.TimeoutError:
+                self._record_provider_failure(
+                    provider.name, TimeoutError(f"{method_name} timed out after {timeout}s")
+                )
+                raise
+            except Exception as exc:
+                self._record_provider_failure(provider.name, exc)
+                raise
+
     # -- System prompt -------------------------------------------------------
 
     def build_system_prompt(self) -> str:
@@ -319,8 +388,12 @@ class MemoryManager:
         """
         blocks = []
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                block = provider.system_prompt_block()
+                block = self._call_with_timeout(
+                    provider, "system_prompt_block", timeout=5.0
+                )
                 if block and block.strip():
                     blocks.append(block)
             except Exception as e:
@@ -340,8 +413,12 @@ class MemoryManager:
         """
         parts = []
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                result = provider.prefetch(query, session_id=session_id)
+                result = self._call_with_timeout(
+                    provider, "prefetch", timeout=10.0, query=query, session_id=session_id
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -354,8 +431,12 @@ class MemoryManager:
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn."""
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.queue_prefetch(query, session_id=session_id)
+                self._call_with_timeout(
+                    provider, "queue_prefetch", timeout=5.0, query=query, session_id=session_id
+                )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
@@ -367,8 +448,14 @@ class MemoryManager:
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Sync a completed turn to all providers."""
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.sync_turn(user_content, assistant_content, session_id=session_id)
+                self._call_with_timeout(
+                    provider, "sync_turn", timeout=10.0,
+                    user_content=user_content, assistant_content=assistant_content,
+                    session_id=session_id,
+                )
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' sync_turn failed: %s",
@@ -389,6 +476,8 @@ class MemoryManager:
         schemas = []
         seen = set()
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
                 for schema in provider.get_tool_schemas():
                     name = schema.get("name", "")
@@ -447,8 +536,13 @@ class MemoryManager:
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.on_turn_start(turn_number, message, **kwargs)
+                self._call_with_timeout(
+                    provider, "on_turn_start", timeout=5.0,
+                    turn_number=turn_number, message=message, **kwargs
+                )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_turn_start failed: %s",
@@ -458,8 +552,12 @@ class MemoryManager:
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.on_session_end(messages)
+                self._call_with_timeout(
+                    provider, "on_session_end", timeout=10.0, messages=messages
+                )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_session_end failed: %s",
@@ -488,9 +586,12 @@ class MemoryManager:
         if not new_session_id:
             return
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.on_session_switch(
-                    new_session_id,
+                self._call_with_timeout(
+                    provider, "on_session_switch", timeout=5.0,
+                    new_session_id=new_session_id,
                     parent_session_id=parent_session_id,
                     reset=reset,
                     **kwargs,
@@ -509,8 +610,12 @@ class MemoryManager:
         """
         parts = []
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                result = provider.on_pre_compress(messages)
+                result = self._call_with_timeout(
+                    provider, "on_pre_compress", timeout=5.0, messages=messages
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -560,16 +665,25 @@ class MemoryManager:
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
                 metadata_mode = self._provider_memory_write_metadata_mode(provider)
                 if metadata_mode == "keyword":
-                    provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
+                    self._call_with_timeout(
+                        provider, "on_memory_write", timeout=5.0,
+                        action=action, target=target, content=content, metadata=dict(metadata or {})
                     )
                 elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
+                    self._call_with_timeout(
+                        provider, "on_memory_write", timeout=5.0,
+                        action=action, target=target, content=content, metadata=dict(metadata or {})
+                    )
                 else:
-                    provider.on_memory_write(action, target, content)
+                    self._call_with_timeout(
+                        provider, "on_memory_write", timeout=5.0,
+                        action=action, target=target, content=content
+                    )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",
@@ -580,9 +694,12 @@ class MemoryManager:
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.on_delegation(
-                    task, result, child_session_id=child_session_id, **kwargs
+                self._call_with_timeout(
+                    provider, "on_delegation", timeout=5.0,
+                    task=task, result=result, child_session_id=child_session_id, **kwargs
                 )
             except Exception as e:
                 logger.debug(
@@ -594,7 +711,7 @@ class MemoryManager:
         """Shut down all providers (reverse order for clean teardown)."""
         for provider in reversed(self._providers):
             try:
-                provider.shutdown()
+                self._call_with_timeout(provider, "shutdown", timeout=10.0)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' shutdown failed: %s",
@@ -612,8 +729,13 @@ class MemoryManager:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
         for provider in self._providers:
+            if not self._is_provider_healthy(provider.name):
+                continue
             try:
-                provider.initialize(session_id=session_id, **kwargs)
+                self._call_with_timeout(
+                    provider, "initialize", timeout=10.0,
+                    session_id=session_id, **kwargs
+                )
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",

@@ -46,6 +46,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-uv-${{ matrix.python-version }}-
             ${{ runner.os }}-uv-
+            ${{ runner.os }}-
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -91,6 +92,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-uv-${{ matrix.python-version }}-
             ${{ runner.os }}-uv-
+            ${{ runner.os }}-
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}

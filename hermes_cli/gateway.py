@@ -2257,8 +2257,6 @@ KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
 TimeoutStopSec={restart_timeout}
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -2292,8 +2290,6 @@ KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
 TimeoutStopSec={restart_timeout}
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=default.target

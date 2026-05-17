@@ -249,16 +249,14 @@ def build_memory_context_block(raw_context: str) -> str:
 class MemoryManager:
     """Orchestrates the built-in provider plus one or more external providers.
 
-    The builtin provider is always first. Only one non-builtin (external)
-    provider is allowed at a time; attempts to register a second external
-    provider are rejected with a warning. Duplicate names are also rejected.
-    Failures in one provider never block the others.
+    The builtin provider is always first. Multiple external providers
+    can be active simultaneously. Failures in one provider never block
+    the others. Duplicate provider names are rejected with a warning.
     """
 
     def __init__(self) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
-        self._has_external: bool = False  # True once a non-builtin provider is added
         self._lock = threading.RLock()
 
     # -- Registration --------------------------------------------------------
@@ -269,8 +267,6 @@ class MemoryManager:
         Built-in provider (name ``"builtin"``) is always accepted.
         Multiple external providers are allowed, but duplicate names are
         rejected with a warning.
-
-        Thread-safe: protected by ``self._lock``.
         """
         with self._lock:
             is_builtin = provider.name == "builtin"
@@ -294,9 +290,6 @@ class MemoryManager:
                     provider.name, exc,
                 )
                 return
-
-            if not is_builtin:
-                self._has_external = True
 
             self._providers.append(provider)
 
@@ -330,19 +323,6 @@ class MemoryManager:
                 provider.name, len(schemas), ext_count, total_tools,
             )
 
-    @property
-    def providers(self) -> List[MemoryProvider]:
-        """All registered providers in order."""
-        with self._lock:
-            return list(self._providers)
-
-    def get_provider(self, name: str) -> Optional[MemoryProvider]:
-        """Get a provider by name, or None if not registered."""
-        for p in self._providers:
-            if p.name == name:
-                return p
-        return None
-
     def remove_provider(self, name: str) -> bool:
         """Deregister a memory provider by name. Returns True if removed."""
         if name == "builtin":
@@ -373,8 +353,7 @@ class MemoryManager:
     @property
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
-        with self._lock:
-            return list(self._providers)
+        return list(self._providers)
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""
@@ -382,33 +361,6 @@ class MemoryManager:
             if p.name == name:
                 return p
         return None
-
-    def remove_provider(self, name: str) -> bool:
-        """Deregister a memory provider by name. Returns True if removed."""
-        if name == "builtin":
-            logger.warning("Cannot remove builtin memory provider")
-            return False
-
-        with self._lock:
-            for i, p in enumerate(self._providers):
-                if p.name == name:
-                    # Remove tool mappings
-                    tools_to_remove = [t for t, prov in self._tool_to_provider.items() if prov is p]
-                    for t in tools_to_remove:
-                        del self._tool_to_provider[t]
-
-                    # Shutdown the provider
-                    try:
-                        p.shutdown()
-                    except Exception as exc:
-                        logger.warning("Provider '%s' shutdown failed: %s", name, exc)
-
-                    self._providers.pop(i)
-                    logger.info("Memory provider '%s' removed (had %d tools)", name, len(tools_to_remove))
-                    return True
-
-            logger.warning("Provider '%s' not found for removal", name)
-            return False
 
     # -- System prompt -------------------------------------------------------
 
@@ -509,15 +461,8 @@ class MemoryManager:
 
     # -- Tools ---------------------------------------------------------------
 
-    def get_all_tool_schemas(self, *, toolsets_enabled: set = None) -> List[Dict[str, Any]]:
-        """Collect tool schemas from all providers.
-
-        If *toolsets_enabled* is provided and does not contain ``'memory'``,
-        skip memory tools entirely (they depend on the memory toolset).
-        """
-        if toolsets_enabled is not None and 'memory' not in toolsets_enabled:
-            return []
-
+    def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Collect tool schemas from all providers."""
         schemas = []
         seen = set()
         for provider in self._providers:
@@ -532,15 +477,6 @@ class MemoryManager:
                     "Memory provider '%s' get_tool_schemas() failed: %s",
                     provider.name, e,
                 )
-
-        TOOL_BUDGET_WARN_THRESHOLD = 20
-        total_memory_tools = len(self._tool_to_provider)
-        if total_memory_tools > TOOL_BUDGET_WARN_THRESHOLD:
-            logger.warning(
-                "Memory tool budget: %d tools registered (threshold: %d). May degrade tool-calling accuracy.",
-                total_memory_tools, TOOL_BUDGET_WARN_THRESHOLD,
-            )
-
         return schemas
 
     def get_all_tool_names(self) -> set:

@@ -9,8 +9,9 @@ Each subdirectory must contain ``__init__.py`` with a class implementing
 the MemoryProvider ABC.  On name collisions, bundled providers take
 precedence.
 
-Only ONE provider can be active at a time, selected via
-``memory.provider`` in config.yaml.
+Multiple providers can be active simultaneously, configured via
+``memory.providers`` list (or legacy ``memory.provider`` string)
+in config.yaml.  Results are merged across all active providers.
 
 Usage:
     from plugins.memory import discover_memory_providers, load_memory_provider
@@ -22,39 +23,15 @@ Usage:
 from __future__ import annotations
 
 import importlib
-import importlib.machinery
 import importlib.util
 import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
-from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
-
-# Synthetic parent package for user-installed providers, so they don't
-# collide with bundled providers in sys.modules.
-_USER_NAMESPACE = "_hermes_user_memory"
-
-
-def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
-    """Register an empty package shell in sys.modules.
-
-    User-installed providers import as ``_hermes_user_memory.<name>``, a
-    dotted name whose parents exist nowhere on disk.  Unless those parents
-    are present in ``sys.modules``, any relative import inside the plugin
-    (``from . import config``) fails with
-    ``ModuleNotFoundError: No module named '_hermes_user_memory'`` — the
-    same reason the loader already registers ``plugins`` and
-    ``plugins.memory`` for bundled providers.
-    """
-    if name in sys.modules:
-        return
-    spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
-    spec.submodule_search_locations = search_locations
-    sys.modules[name] = importlib.util.module_from_spec(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -216,18 +193,15 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
     # Use a separate namespace for user-installed plugins so they don't
     # collide with bundled providers in sys.modules.
     _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
-    module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+    module_name = f"plugins.memory.{name}" if _is_bundled else f"_hermes_user_memory.{name}"
     init_file = provider_dir / "__init__.py"
 
     if not init_file.exists():
         return None
 
-    # Check if already loaded.  A synthetic package shell registered by
-    # discover_plugin_cli_commands() for relative-import support has no
-    # __file__; only reuse modules that were actually loaded from disk.
-    cached = sys.modules.get(module_name)
-    if cached is not None and getattr(cached, "__file__", None):
-        mod = cached
+    # Check if already loaded
+    if module_name in sys.modules:
+        mod = sys.modules[module_name]
     else:
         # Handle relative imports within the plugin
         # First ensure the parent packages are registered
@@ -249,11 +223,6 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                             spec.loader.exec_module(parent_mod)
                         except Exception:
                             pass
-
-        # User-installed plugins need their synthetic parent registered the
-        # same way, or relative imports inside the plugin cannot resolve.
-        if not _is_bundled:
-            _register_synthetic_package(_USER_NAMESPACE, [])
 
         # Now load the provider module
         spec = importlib.util.spec_from_file_location(
@@ -336,31 +305,40 @@ class _ProviderCollector:
         pass  # CLI registration happens via discover_plugin_cli_commands()
 
 
-def _get_active_memory_provider() -> Optional[str]:
-    """Read the active memory provider name from config.yaml.
+def get_active_memory_providers() -> list:
+    """Return list of active memory provider names from config.
 
-    Returns the provider name (e.g. ``"honcho"``) or None if no
-    external provider is configured.  Lightweight — only reads config,
-    no plugin loading.
+    Supports both old format (memory.provider: 'honcho') and
+    new format (memory.providers: ['honcho', 'mem0']).
+    New format takes precedence when non-empty.
     """
     try:
         from hermes_cli.config import load_config
         config = load_config()
-        return cfg_get(config, "memory", "provider") or None
+        memory_config = config.get('memory', {})
+
+        # New list format takes precedence
+        providers = memory_config.get('providers', [])
+        if providers:
+            return [p for p in providers if p]
+
+        # Fall back to legacy single-string format
+        single = memory_config.get('provider', '')
+        return [single] if single else []
     except Exception:
-        return None
+        return []
 
 
 def discover_plugin_cli_commands() -> List[dict]:
-    """Return CLI commands for the **active** memory plugin only.
+    """Return CLI commands for **active** memory plugins.
 
-    Only one memory provider can be active at a time (set via
-    ``memory.provider`` in config.yaml).  This function reads that
-    value and only loads CLI registration for the matching plugin.
+    Multiple memory providers can be active simultaneously (set via
+    ``memory.providers`` list in config.yaml).  This function reads that
+    list and loads CLI registration for all matching plugins.
     If no provider is active, no commands are registered.
 
-    Looks for a ``register_cli(subparser)`` function in the active
-    plugin's ``cli.py``.  Returns a list of at most one dict with
+    Looks for a ``register_cli(subparser)`` function in each active
+    provider's ``cli.py``.  Returns a list of dicts with
     keys: ``name``, ``help``, ``description``, ``setup_fn``,
     ``handler_fn``.
 
@@ -372,79 +350,67 @@ def discover_plugin_cli_commands() -> List[dict]:
     if not _MEMORY_PLUGINS_DIR.is_dir():
         return results
 
-    active_provider = _get_active_memory_provider()
-    if not active_provider:
+    active_providers = get_active_memory_providers()
+    if not active_providers:
         return results
 
-    # Only look at the active provider's directory
-    plugin_dir = find_provider_dir(active_provider)
-    if not plugin_dir:
-        return results
+    for active_provider in active_providers:
+        # Look at each active provider's directory
+        plugin_dir = find_provider_dir(active_provider)
+        if not plugin_dir:
+            continue
 
-    cli_file = plugin_dir / "cli.py"
-    if not cli_file.exists():
-        return results
+        cli_file = plugin_dir / "cli.py"
+        if not cli_file.exists():
+            continue
 
-    _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
-    module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"{_USER_NAMESPACE}.{active_provider}.cli"
-    try:
-        # Import the CLI module (lightweight — no SDK needed)
-        if module_name in sys.modules:
-            cli_mod = sys.modules[module_name]
-        else:
-            if not _is_bundled:
-                # cli.py imports as _hermes_user_memory.<name>.cli, usually
-                # before the provider itself is loaded.  Register its parent
-                # packages so relative imports inside cli.py
-                # ("from . import config") resolve without executing the
-                # plugin's __init__.py.  The package shell has no __file__,
-                # so _load_provider_from_dir() will still load the real
-                # module later instead of reusing the shell.
-                _register_synthetic_package(_USER_NAMESPACE, [])
-                _register_synthetic_package(
-                    f"{_USER_NAMESPACE}.{active_provider}", [str(plugin_dir)]
+        _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
+        module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"_hermes_user_memory.{active_provider}.cli"
+        try:
+            # Import the CLI module (lightweight — no SDK needed)
+            if module_name in sys.modules:
+                cli_mod = sys.modules[module_name]
+            else:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, str(cli_file)
                 )
-            spec = importlib.util.spec_from_file_location(
-                module_name, str(cli_file)
-            )
-            if not spec or not spec.loader:
-                return results
-            cli_mod = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = cli_mod
-            spec.loader.exec_module(cli_mod)
+                if not spec or not spec.loader:
+                    continue
+                cli_mod = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = cli_mod
+                spec.loader.exec_module(cli_mod)
 
-        register_cli = getattr(cli_mod, "register_cli", None)
-        if not callable(register_cli):
-            return results
+            register_cli = getattr(cli_mod, "register_cli", None)
+            if not callable(register_cli):
+                continue
 
-        # Read metadata from plugin.yaml if available
-        help_text = f"Manage {active_provider} memory plugin"
-        description = ""
-        yaml_file = plugin_dir / "plugin.yaml"
-        if yaml_file.exists():
-            try:
-                import yaml
-                with open(yaml_file, encoding="utf-8-sig") as f:
-                    meta = yaml.safe_load(f) or {}
-                desc = meta.get("description", "")
-                if desc:
-                    help_text = desc
-                    description = desc
-            except Exception:
-                pass
+            # Read metadata from plugin.yaml if available
+            help_text = f"Manage {active_provider} memory plugin"
+            description = ""
+            yaml_file = plugin_dir / "plugin.yaml"
+            if yaml_file.exists():
+                try:
+                    import yaml
+                    with open(yaml_file, encoding="utf-8-sig") as f:
+                        meta = yaml.safe_load(f) or {}
+                    desc = meta.get("description", "")
+                    if desc:
+                        help_text = desc
+                        description = desc
+                except Exception:
+                    pass
 
-        handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
-                     getattr(cli_mod, "honcho_command", None)
+            handler_fn = getattr(cli_mod, f"{active_provider}_command", None)
 
-        results.append({
-            "name": active_provider,
-            "help": help_text,
-            "description": description,
-            "setup_fn": register_cli,
-            "handler_fn": handler_fn,
-            "plugin": active_provider,
-        })
-    except Exception as e:
-        logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
+            results.append({
+                "name": active_provider,
+                "help": help_text,
+                "description": description,
+                "setup_fn": register_cli,
+                "handler_fn": handler_fn,
+                "plugin": active_provider,
+            })
+        except Exception as e:
+            logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
 
     return results

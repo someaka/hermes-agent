@@ -4906,3 +4906,61 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_marks_consumed_after_dispatch(monkeypatch):
+    """After successfully dispatching a completion, the poller marks it consumed."""
+    from tools.process_registry import process_registry
+
+    turns = []
+    emitted = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            turns.append(prompt)
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+        def start(self):
+            self._target()
+
+    sess = _session(agent=_Agent())
+    server._sessions["sid_consume"] = sess
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    process_registry._completion_consumed.discard("proc_consume_test")
+
+    stop = threading.Event()
+
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_consume_test",
+        "command": "echo consumed",
+        "exit_code": 0,
+        "output": "consumed",
+    })
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_consume", sess)
+
+        # Should have triggered an agent turn
+        assert len(turns) == 1
+
+        # Completion should now be marked as consumed
+        assert process_registry.is_completion_consumed("proc_consume_test")
+    finally:
+        server._sessions.pop("sid_consume", None)
+        process_registry._completion_consumed.discard("proc_consume_test")
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()

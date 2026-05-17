@@ -3364,6 +3364,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
+            process_registry.mark_completion_consumed(_evt_sid)
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -3399,6 +3400,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text)
+            process_registry.mark_completion_consumed(_evt_sid)
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "

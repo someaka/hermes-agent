@@ -949,6 +949,7 @@ class ProcessRegistry:
         }
         if session.exited:
             result["exit_code"] = session.exit_code
+            self._completion_consumed.add(session_id)   # #10156: suppress redundant TUI notification
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output history unavailable"

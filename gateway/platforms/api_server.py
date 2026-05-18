@@ -32,6 +32,7 @@ Requires:
 """
 
 import asyncio
+import contextvars
 import hashlib
 import hmac
 import json
@@ -3494,7 +3495,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-        return await loop.run_in_executor(None, _run)
+        _ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, _ctx.run, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -3756,7 +3758,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                result, usage = await asyncio.get_running_loop().run_in_executor(
+                    None, contextvars.copy_context().run, _run_sync
+                )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).

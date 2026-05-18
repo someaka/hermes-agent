@@ -51,17 +51,18 @@ def _make_session(
 # ========================================================================
 
 class TestTuiNotificationPath:
-    """Verify TUI event-driven callback dispatches completions."""
+    """Verify TUI poller loop dispatches completions and marks consumed."""
 
-    def test_tui_callback_exists_and_has_key_lines(self):
-        """Source guard: _on_process_event must contain the expected logic."""
+    def test_tui_poller_loop_exists_and_has_key_lines(self):
+        """Source guard: _notification_poller_loop must contain the expected logic."""
         src = Path("tui_gateway/server.py").read_text()
-        assert "def _on_process_event(" in src
-        assert "format_process_notification" in src
-        assert "def push_kanban_event(" in src
+        assert "def _notification_poller_loop(" in src
+        assert "process_registry.completion_queue.get(timeout=0.5)" in src
+        assert "process_registry.is_completion_consumed(_evt_sid)" in src
+        assert "process_registry.mark_completion_consumed(_evt_sid)" in src
 
-    def test_tui_callback_dispatches_completion(self, monkeypatch):
-        """After dispatching a completion, the callback triggers an agent turn."""
+    def test_tui_poller_marks_consumed_after_dispatch(self, monkeypatch):
+        """After dispatching a completion, the TUI poller marks it consumed."""
         import tui_gateway.server as server
 
         turns = []
@@ -76,7 +77,7 @@ class TestTuiNotificationPath:
                 }
 
         class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
+            def __init__(self, target=None, daemon=None):
                 self._target = target
             def start(self):
                 self._target()
@@ -101,17 +102,29 @@ class TestTuiNotificationPath:
         monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
         monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
 
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+        process_registry._completion_consumed.discard("proc_tui_guard")
+
+        stop = threading.Event()
+        process_registry.completion_queue.put({
+            "type": "completion",
+            "session_id": "proc_tui_guard",
+            "command": "echo hello",
+            "exit_code": 0,
+            "output": "hello",
+        })
+        stop.set()
+
         try:
-            server._on_process_event({
-                "type": "completion",
-                "session_id": "proc_tui_guard",
-                "command": "echo hello",
-                "exit_code": 0,
-                "output": "hello",
-            })
+            server._notification_poller_loop(stop, "sid_tui_guard", sess)
             assert len(turns) == 1
+            assert process_registry.is_completion_consumed("proc_tui_guard")
         finally:
             server._sessions.pop("sid_tui_guard", None)
+            process_registry._completion_consumed.discard("proc_tui_guard")
+            while not process_registry.completion_queue.empty():
+                process_registry.completion_queue.get_nowait()
 
 
 # ========================================================================
@@ -124,9 +137,8 @@ class TestGatewayWatcherPath:
     def test_gateway_has_pending_watchers_drain(self):
         """Source guard: gateway/run.py must drain pending_watchers after agent runs."""
         src = Path("gateway/run.py").read_text()
-        # Atomic batch detach: grab the list, replace with empty, iterate detached copy.
-        # This prevents watchers appended during iteration from being silently dropped.
-        assert "process_registry.pending_watchers = []" in src
+        assert "while process_registry.pending_watchers:" in src
+        assert "process_registry.pending_watchers.pop(0)" in src
         assert "asyncio.create_task(self._run_process_watcher(watcher))" in src
 
     def test_gateway_watcher_checks_is_completion_consumed(self):
@@ -241,11 +253,7 @@ class TestNoDuplicateNotifications:
     """Verify the three dedup mechanisms are intact."""
 
     def test_poll_does_not_mark_consumed(self):
-        """poll() on exited session must NOT mark completion as consumed.
-
-        poll() is a read-only status query. Only mark_completion_consumed()
-        and wait() are allowed to consume notifications.
-        """
+        """poll() must be read-only and must NOT add to _completion_consumed."""
         registry = ProcessRegistry()
         s = _make_session(sid="proc_poll_dup", notify_on_complete=True, output="done")
         s.exited = True
@@ -308,13 +316,8 @@ class TestNoDuplicateNotifications:
 class TestPollFixPreserved:
     """Verify the core poll() fix (#10156) is still in effect."""
 
-    def test_poll_function_lacks_completion_consumed_add(self):
-        """AST guard: poll() body MUST NOT contain _completion_consumed.add().
-
-        poll() is a read-only status query.  mark_completion_consumed() is the
-        explicit writer.  Adding _completion_consumed.add to poll() causes
-        duplicate-notification suppression on read-only status checks.
-        """
+    def test_poll_function_has_no_completion_consumed_add(self):
+        """AST guard: poll() body must NOT contain _completion_consumed.add()."""
         src = Path("tools/process_registry.py").read_text()
         tree = ast.parse(src)
 
@@ -326,19 +329,18 @@ class TestPollFixPreserved:
 
         assert poll_body is not None, "poll() function not found"
 
-        found = False
+        # Walk the poll function body looking for _completion_consumed.add calls
         for child in ast.walk(poll_body):
             if isinstance(child, ast.Attribute):
+                # Look for .add on _completion_consumed
                 if child.attr == "add":
+                    # Check the value chain leads to _completion_consumed
                     val = child.value
                     if isinstance(val, ast.Attribute) and val.attr == "_completion_consumed":
-                        found = True
-                        break
-
-        assert not found, (
-            "poll() contains _completion_consumed.add() — "
-            "poll is read-only, use mark_completion_consumed() instead"
-        )
+                        pytest.fail(
+                            "poll() contains _completion_consumed.add() — "
+                            "the #10156 fix has been regressed"
+                        )
 
     def test_mark_completion_consumed_method_exists(self):
         """The explicit mark_completion_consumed() method must exist for TUI use."""
@@ -346,24 +348,26 @@ class TestPollFixPreserved:
         assert callable(process_registry.mark_completion_consumed)
 
     def test_git_history_has_fix_not_revert(self):
-        """Git guard: the fix commit (poll() no longer marks consumed) exists and the revert was overridden."""
+        """Git guard: the most recent commit touching process_registry.py must be the fix, not the revert."""
         import subprocess
 
-        # Search all branches for commits touching this file
         result = subprocess.run(
-            ["git", "log", "--oneline", "--all", "--", "tools/process_registry.py"],
+            ["git", "log", "--oneline", "HEAD~5..HEAD", "--", "tools/process_registry.py"],
             capture_output=True,
             text=True,
             cwd=Path("."),
         )
         lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+        assert lines, "No commits found touching process_registry.py in HEAD~5..HEAD"
 
-        # The fix commit (fd8df065b) must exist and be more recent than the revert (40aeab697)
-        fix_sha = "fd8df065b"
-        revert_sha = "40aeab697"
-        fix_idx = next((i for i, ln in enumerate(lines) if fix_sha in ln), None)
-        revert_idx = next((i for i, ln in enumerate(lines) if revert_sha in ln), None)
-        if fix_idx is not None and revert_idx is not None:
-            assert fix_idx < revert_idx, (
-                f"fix commit {fix_sha} must be MORE RECENT (lower index) than revert {revert_sha}"
-            )
+        # The most recent commit should NOT be the revert 40aeab697
+        most_recent = lines[0]
+        assert "40aeab697" not in most_recent, (
+            f"Most recent commit is the revert: {most_recent}"
+        )
+
+        # It should reference the fix or be a successor
+        assert any(
+            keyword in most_recent.lower()
+            for keyword in ["poll", "completion", "consumed", "remove", "stale", "docs"]
+        ), f"Most recent commit does not look like the fix or successor: {most_recent}"

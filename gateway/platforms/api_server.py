@@ -17,10 +17,6 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
-    - agent lifecycle events (run.queued, run.running, run.completed, run.failed)
-    - tool progress events (tool.started, tool.completed, tool.failed)
-    - approval events (approval.request)
-    - background process events (process.completed, process.watch_match)
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
@@ -36,7 +32,6 @@ Requires:
 """
 
 import asyncio
-import contextvars
 import hashlib
 import hmac
 import json
@@ -428,19 +423,7 @@ class ResponseStore:
             (time.time(), response_id),
         )
         self._conn.commit()
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "Corrupted JSON in response store for id=%s, evicting entry",
-                response_id,
-            )
-            self._conn.execute(
-                "DELETE FROM responses WHERE response_id = ?",
-                (response_id,),
-            )
-            self._conn.commit()
-            return None
+        return json.loads(row[0])
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
@@ -557,12 +540,6 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
-
-
-def _sanitize_error_msg(exc: Exception, max_len: int = 200) -> str:
-    """Return a sanitized error string safe for HTTP responses."""
-    from hermes_cli.sanitize import sanitize_error_msg
-    return sanitize_error_msg(exc, max_len=max_len)
 
 
 if AIOHTTP_AVAILABLE:
@@ -740,9 +717,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
-        # Reverse mapping: approval_session_key -> run_id, so that
-        # background process watchers can push events to the right SSE queue.
-        self._session_to_run: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -2588,7 +2562,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent_error = result["error"]
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
-                agent_error = _sanitize_error_msg(e)
+                agent_error = str(e)
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -3123,7 +3097,7 @@ class APIServerAdapter(BasePlatformAdapter):
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs — create a new cron job."""
@@ -3172,7 +3146,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/{job_id} — get a single cron job."""
@@ -3191,7 +3165,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""
@@ -3224,7 +3198,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
         """DELETE /api/jobs/{job_id} — delete a cron job."""
@@ -3243,7 +3217,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"ok": True})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/pause — pause a cron job."""
@@ -3262,7 +3236,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
@@ -3281,7 +3255,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/run — trigger immediate execution."""
@@ -3300,7 +3274,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
-            return web.json_response({"error": _sanitize_error_msg(e)}, status=500)
+            return web.json_response({"error": str(e)}, status=500)
 
     # ------------------------------------------------------------------
     # Output extraction helper
@@ -3520,8 +3494,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-        _ctx = contextvars.copy_context()
-        return await loop.run_in_executor(None, _ctx.run, _run)
+        return await loop.run_in_executor(None, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -3591,76 +3564,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
-
-    async def _run_api_server_watcher(
-        self,
-        watcher: dict,
-        run_id: str,
-        q: "asyncio.Queue",
-    ) -> None:
-        """Poll a background process and push completion events to the SSE queue.
-
-        This is the api_server equivalent of Gateway._run_process_watcher.
-        Instead of injecting a synthetic message into the gateway adapter,
-        we emit a structured ``process.completed`` event on the run's SSE stream.
-        """
-        from tools.process_registry import process_registry
-        from tools.ansi_strip import strip_ansi
-
-        session_id = watcher["session_id"]
-        interval = watcher["check_interval"]
-        agent_notify = watcher.get("notify_on_complete", False)
-
-        logger.debug(
-            "API server watcher started: %s (every %ss, agent_notify=%s)",
-            session_id, interval, agent_notify,
-        )
-
-        while True:
-            await asyncio.sleep(interval)
-            session = process_registry.get(session_id)
-            if session is None:
-                break
-            if session.exited:
-                from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    _out = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-                    try:
-                        q.put_nowait({
-                            "event": "process.completed",
-                            "run_id": run_id,
-                            "timestamp": time.time(),
-                            "session_id": session_id,
-                            "command": session.command,
-                            "exit_code": session.exit_code,
-                            "output": _out,
-                        })
-                    except Exception:
-                        pass
-                break
-
-    def push_process_event(self, process_event: dict) -> bool:
-        """Push a background process event to the SSE queue for the owning run.
-
-        Called by the gateway's _run_process_watcher when platform is api_server.
-        Uses the session_key from the watcher to look up the active run's SSE queue.
-
-        Returns True if the event was pushed, False if no active run found.
-        """
-        session_key = process_event.get("session_key", "")
-        run_id = self._session_to_run.get(session_key)
-        if not run_id:
-            return False
-        q = self._run_streams.get(run_id)
-        if q is None:
-            # Run may have finished; clean up stale mapping
-            self._session_to_run.pop(session_key, None)
-            return False
-        try:
-            q.put_nowait(process_event)
-            return True
-        except Exception:
-            return False
 
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -3750,7 +3653,6 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
-        self._session_to_run[approval_session_key] = run_id
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -3777,7 +3679,6 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
-            _watcher_tasks = []
             try:
                 self._set_run_status(run_id, "running")
                 agent = self._create_agent(
@@ -3826,11 +3727,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = set_session_vars(
                             platform="api_server",
-                            chat_id=body.get("chat_id", ""),
-                            chat_name=body.get("chat_name", ""),
-                            thread_id=str(body.get("thread_id", "")) if body.get("thread_id") else "",
-                            user_id=str(body.get("user_id", "")) if body.get("user_id") else "",
-                            user_name=str(body.get("user_name", "")) if body.get("user_name") else "",
                             session_key=approval_session_key,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
@@ -3860,55 +3756,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(
-                    None, contextvars.copy_context().run, _run_sync
-                )
-
-                # Spawn process watchers for any background processes started during the run.
-                # The gateway path does this in _handle_message_with_agent (run.py:7950).
-                # The api_server must do it here because it does not go through the gateway handler.
-                try:
-                    from tools.process_registry import process_registry
-                    my_watchers = [
-                        w for w in process_registry.pending_watchers
-                        if w.get("session_key") == approval_session_key
-                    ]
-                    for w in my_watchers:
-                        process_registry.pending_watchers.remove(w)
-                        t = asyncio.create_task(self._run_api_server_watcher(w, run_id, q))
-                        _watcher_tasks.append(t)
-                except Exception as e:
-                    logger.error("[api_server] process watcher setup error: %s", e)
-
-                # Drain watch-pattern events that arrived during the agent run.
-                # Completion events are handled by the watcher tasks above;
-                # any orphaned queue events are harmless (skipped on next drain).
-                try:
-                    from tools.process_registry import process_registry as _pr
-                    _watch_events = []
-                    while not _pr.completion_queue.empty():
-                        evt = _pr.completion_queue.get_nowait()
-                        evt_type = evt.get("type", "completion")
-                        if evt_type in {"watch_match", "watch_disabled"}:
-                            _watch_events.append(evt)
-                    for evt in _watch_events:
-                        from gateway.run import _format_gateway_process_notification
-                        synth_text = _format_gateway_process_notification(evt)
-                        if synth_text:
-                            try:
-                                q.put_nowait({
-                                    "event": "process.watch_match",
-                                    "run_id": run_id,
-                                    "timestamp": time.time(),
-                                    "session_id": evt.get("session_id"),
-                                    "pattern": evt.get("pattern"),
-                                    "output": evt.get("output"),
-                                })
-                            except Exception as e2:
-                                logger.error("[api_server] watch event push error: %s", e2)
-                except Exception as e:
-                    logger.error("[api_server] watch event drain error: %s", e)
-
+                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -3962,7 +3810,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=_sanitize_error_msg(exc),
+                    error=str(exc),
                     last_event="run.failed",
                 )
                 try:
@@ -3970,14 +3818,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": _sanitize_error_msg(exc),
+                        "error": str(exc),
                     })
                 except Exception:
                     pass
             finally:
-                # Cancel any watcher tasks spawned for this run.
-                for wt in _watcher_tasks:
-                    wt.cancel()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -3996,9 +3841,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
-                _ak = self._run_approval_sessions.pop(run_id, None)
-                if _ak:
-                    self._session_to_run.pop(_ak, None)
+                self._run_approval_sessions.pop(run_id, None)
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -4139,7 +3982,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(_sanitize_error_msg(exc)), status=500)
+            return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
             return web.json_response(
@@ -4235,9 +4078,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_streams_created.pop(run_id, None)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
-                _ak = self._run_approval_sessions.pop(run_id, None)
-                if _ak:
-                    self._session_to_run.pop(_ak, None)
+                self._run_approval_sessions.pop(run_id, None)
 
             stale_statuses = [
                 run_id

@@ -722,6 +722,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Reverse mapping: approval_session_key -> run_id, so that
+        # background process watchers can push events to the right SSE queue.
+        self._session_to_run: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -3706,6 +3709,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
+        self._session_to_run[approval_session_key] = run_id
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
@@ -4329,6 +4333,25 @@ class APIServerAdapter(BasePlatformAdapter):
             self._runner = None
         self._app = None
         logger.info("[%s] API server stopped", self.name)
+
+    def push_process_event(self, session_key: str, event: dict) -> bool:
+        """Push a process completion event to the SSE queue for the given session_key.
+
+        Used by the gateway's _run_process_watcher to deliver background-process
+        notifications to api_server clients when the watcher's platform is
+        "api_server" (the adapter's send()/handle_message() paths do not work
+        for HTTP/SSE delivery).
+        """
+        for run_id, sk in self._run_approval_sessions.items():
+            if sk == session_key:
+                q = self._run_streams.get(run_id)
+                if q is not None:
+                    try:
+                        q.put_nowait(event)
+                        return True
+                    except Exception:
+                        pass
+        return False
 
     async def send(
         self,

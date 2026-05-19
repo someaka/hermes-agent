@@ -437,14 +437,18 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
 
 
 @pytest.mark.asyncio
-async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
+async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home, monkeypatch):
     """`/kanban --board <slug> create ...` must subscribe on that board.
 
     The gateway handler currently auto-subscribes after `/kanban create`,
     but the create detection must still work when the shared `--board`
     flag appears before the subcommand, and the subscription must land in
     that board's DB rather than the ambient/default board.
+
+    In gateway mode (detected via ``_HERMES_GATEWAY=1``), _cmd_create
+    skips its own CLI auto-subscribe so this handler is the sole subscriber.
     """
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 

@@ -1357,6 +1357,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        # Auto-subscribe the current CLI session so the user gets
+        # terminal-state notifications (completed/blocked/crashed/etc.)
+        # when this task finishes. Uses a per-session PID-based chat_id
+        # so multiple concurrent CLI sessions don't stomp each other.
+        # Skip when called from the gateway handler (which manages its
+        # own auto-subscribe via GatewayRunner._handle_kanban_command).
+        if not _gateway_kanban_in_progress:
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="cli",
+                chat_id=f"cli-{os.getpid()}",
+            )
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:

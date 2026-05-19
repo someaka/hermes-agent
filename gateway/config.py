@@ -446,6 +446,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
     ),
+    Platform.GOOGLE_CHAT: lambda cfg: bool(
+        os.getenv("GOOGLE_CHAT_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    ),
 }
 
 

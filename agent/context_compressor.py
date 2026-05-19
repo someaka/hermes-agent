@@ -543,6 +543,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_compress_aborted = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
@@ -667,6 +668,7 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
+        self._last_compress_aborted: bool = False
         # When a user-configured summary model fails and we recover by
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
@@ -1828,7 +1830,7 @@ The following context was extracted by active memory providers before this compa
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, memory_context: str = "") -> List[Dict[str, Any]]:
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, memory_context: str = "", force: bool = False) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1852,8 +1854,13 @@ The following context was extracted by active memory providers before this compa
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
+        self._last_compress_aborted = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        # When force=True (manual /compress), bypass the failure cooldown so
+        # the user can retry immediately instead of waiting 30-60s.
+        if force:
+            self._summary_failure_cooldown_until = 0.0
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1

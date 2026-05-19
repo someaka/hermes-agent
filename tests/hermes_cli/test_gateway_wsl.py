@@ -210,6 +210,9 @@ class TestGatewayCommandWSLMessages:
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway, "is_macos", lambda: False)
         monkeypatch.setattr(gateway, "is_managed", lambda: False)
+        # Stub prompt_yes_no — the install path reads stdin while pytest
+        # captures it, which raises OSError. (#28631)
+        monkeypatch.setattr(gateway, "prompt_yes_no", lambda q, default=True: default)
 
         # Mock systemd_install to capture call
         install_called = []
@@ -217,6 +220,7 @@ class TestGatewayCommandWSLMessages:
             gateway, "systemd_install",
             lambda **kwargs: install_called.append(kwargs),
         )
+        monkeypatch.setattr(gateway, "systemd_start", lambda system=False: None)
 
         args = SimpleNamespace(
             gateway_command="install", force=False, system=False,

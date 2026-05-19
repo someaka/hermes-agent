@@ -34,6 +34,13 @@ from hermes_cli.kanban import run_slash
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    # Create the kanban-worker skill so _default_spawn's
+    # _kanban_worker_skill_available() resolves True, matching the
+    # real deployment layout (it ships with the default root home).
+    (home / "skills" / "devops" / "kanban-worker").mkdir(parents=True)
+    (home / "skills" / "devops" / "kanban-worker" / "SKILL.md").write_text(
+        "frontmatter placeholder", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()

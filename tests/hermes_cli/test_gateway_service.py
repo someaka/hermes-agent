@@ -1003,19 +1003,23 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        # Stub prompt_yes_no — the install path reads stdin while pytest
+        # captures it, which raises OSError. (#28631)
+        monkeypatch.setattr(gateway_cli, "prompt_yes_no", lambda q, default=True: default)
 
         calls = []
         monkeypatch.setattr(
             gateway_cli,
             "systemd_install",
-            lambda force=False, system=False, run_as_user=None: calls.append((force, system, run_as_user)),
+            lambda **kwargs: calls.append(kwargs),
         )
+        monkeypatch.setattr(gateway_cli, "systemd_start", lambda system=False: None)
 
         gateway_cli.gateway_command(
             SimpleNamespace(gateway_command="install", force=True, system=True, run_as_user="alice")
         )
 
-        assert calls == [(True, True, "alice")]
+        assert calls == [{"force": True, "system": True, "run_as_user": "alice", "enable_on_startup": True}]
 
     def test_gateway_install_reports_termux_manual_mode(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: True)

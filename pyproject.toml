@@ -218,7 +218,9 @@ all = [
   # [all] would break every fresh install / AUR build / Docker build / CI
   # run until PyPI un-quarantines. Users who explicitly want Voxtral STT/TTS
   # can still `pip install hermes-agent[mistral]` once it's available again.
-  "hermes-agent[bedrock]",
+  # bedrock: intentionally excluded from [all] — boto3 is a heavy AWS SDK
+  # dependency that most users don't need; install explicitly with
+  # `pip install hermes-agent[bedrock]` when using AWS Bedrock.
   "hermes-agent[web]",
   "hermes-agent[youtube]",
 ]

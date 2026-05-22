@@ -1384,7 +1384,36 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+
+        # Auto-subscribe the CLI session so notifications reach the user.
+        # Use platform='cli' with a PID-based chat_id so any future CLI
+        # side-channel (drain thread, TUI FIFO bridge) can pick them up.
+        _auto_subscribe_cli(task_id)
     return 0
+
+
+def _auto_subscribe_cli(task_id: str) -> None:
+    """Subscribe the current CLI process to kanban task events.
+
+    Uses ``platform='cli'`` with ``chat_id=f'cli-{os.getpid()}'`` so that
+    a CLI-side notification drain (or the TUI FIFO bridge) can later claim
+    and deliver terminal-state events to the user.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        import os as _os
+        with _kb.connect() as _conn:
+            _kb.add_notify_sub(
+                _conn, task_id=task_id,
+                platform="cli",
+                chat_id=f"cli-{_os.getpid()}",
+                thread_id=None,
+                user_id=None,
+                notifier_profile=_profile_author(),
+            )
+    except Exception as exc:
+        # Non-fatal — the task was created successfully regardless.
+        print(f"  (auto-subscribe skipped: {exc})", file=sys.stderr)
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:

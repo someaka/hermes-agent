@@ -161,6 +161,7 @@ class TestAppendEventFifoWriter:
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="crash task", assignee="worker")
             kb._append_event(conn, tid, kind="crashed")
+        kb._flush_pending_fifo_writes()
 
         t.join(timeout=5)
         assert len(_messages) == 1
@@ -183,6 +184,7 @@ class TestAppendEventFifoWriter:
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="timeout task", assignee="worker")
             kb._append_event(conn, tid, kind="timed_out")
+        kb._flush_pending_fifo_writes()
 
         t.join(timeout=5)
         assert len(_messages) == 1
@@ -205,6 +207,7 @@ class TestAppendEventFifoWriter:
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="give-up task", assignee="worker")
             kb._append_event(conn, tid, kind="gave_up")
+        kb._flush_pending_fifo_writes()
 
         t.join(timeout=5)
         assert len(_messages) == 1
@@ -647,13 +650,16 @@ class TestFifoWriterEdgeCases:
             kb.complete_task(conn, tid, summary="done")
 
     def test_double_close_bug_fixed(self, kanban_home, fifo_path, monkeypatch):
-        """The double-close bug (V3-M1) should be fixed — verify code structure."""
-        # Read the actual source code to verify the fix is in place
+        """The double-close bug (V3-M1) should be fixed — verify code structure.
+
+        The deferred-FIFO-write refactor moved the double-close fix from
+        _append_event to _flush_pending_fifo_writes, where FIFO I/O lives now.
+        """
         import hermes_cli.kanban_db as _kb_module
         import inspect
-        src = inspect.getsource(_kb_module._append_event)
+        src = inspect.getsource(_kb_module._flush_pending_fifo_writes)
 
-        # The fix uses a finally block with _fifo is not None check
+        # The fix initializes _fifo to None before the try block
         assert "_fifo = None" in src, "Should initialize _fifo to None"
         assert "finally:" in src, "Should use finally for cleanup"
         assert "if _fifo is not None:" in src, "Should check _fifo before closing"

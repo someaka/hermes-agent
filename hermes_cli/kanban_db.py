@@ -83,6 +83,7 @@ import sys
 import threading
 import errno
 import logging
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -743,7 +744,7 @@ class Task:
                 parsed = json.loads(row["skills"])
                 if isinstance(parsed, list):
                     skills_value = [str(s) for s in parsed if s]
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 skills_value = None
         return cls(
             id=row["id"],
@@ -836,7 +837,7 @@ class Run:
     def from_row(cls, row: sqlite3.Row) -> "Run":
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             meta = None
         return cls(
             id=int(row["id"]),
@@ -1932,7 +1933,7 @@ def _claimer_id() -> str:
     import socket
     try:
         host = socket.gethostname() or "unknown"
-    except Exception:
+    except OSError:
         host = "unknown"
     return f"{host}:{os.getpid()}"
 
@@ -2578,7 +2579,7 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     for r in rows:
         try:
             payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             payload = None
         out.append(
             Event(
@@ -2623,26 +2624,45 @@ def _append_event(
     if kind in _notify_kinds:
         _fifo_path = os.path.expanduser("~/.hermes/tui_kanban.fifo")
         if os.path.exists(_fifo_path):
+            # Mitigate symlink attacks: verify the path is actually a FIFO.
+            try:
+                if not stat.S_ISFIFO(os.lstat(_fifo_path).st_mode):
+                    _log.warning("kanban_fifo_not_fifo: %s is not a FIFO, skipping", _fifo_path)
+                    return
+            except OSError as _e:
+                _log.warning("kanban_fifo_lstat_error: %s", _e)
+                return
+            _fd = None
+            _fifo = None
             try:
                 # O_NONBLOCK: open(2) on a FIFO blocks until a reader
                 # connects; in CI (and any headless context) there is no
                 # reader, so the write op deadlocks the caller.  Non-blocking
                 # open lets us bail gracefully when no reader is connected.
                 _fd = os.open(_fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-                try:
-                    _fifo = os.fdopen(_fd, "w", encoding="utf-8")
-                    _fifo.write(json.dumps({"task_id": task_id, "kind": kind}) + "\n")
-                    _fifo.close()
-                except OSError as _e:
-                    _log.debug("kanban_fifo_write_error: %s", _e)
-                    os.close(_fd)
+                _fifo = os.fdopen(_fd, "w", encoding="utf-8")
+                _fifo.write(json.dumps({"task_id": task_id, "kind": kind}) + "\n")
+                _fifo.close()
+                _fifo = None
+                _fd = None
             except OSError as _e:
                 if _e.errno == errno.ENXIO:
                     _log.debug("kanban_fifo_no_reader: no TUI listening on %s", _fifo_path)
                 else:
-                    _log.debug("kanban_fifo_open_error: %s", _e)
+                    _log.warning("kanban_fifo_write_error: %s", _e)
             except Exception as _e:
-                _log.debug("kanban_fifo_write_error: %s", _e)
+                _log.warning("kanban_fifo_write_error: %s", _e)
+            finally:
+                if _fifo is not None:
+                    try:
+                        _fifo.close()
+                    except Exception:
+                        pass
+                elif _fd is not None:
+                    try:
+                        os.close(_fd)
+                    except Exception:
+                        pass
 
 
 def _end_run(
@@ -2851,12 +2871,27 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.assignee FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                # Inherit assignee from a parent when the child has none
+                # set. Without this, children promoted via recompute_ready
+                # sit in 'ready' forever because the dispatcher skips
+                # unassigned tasks (dispatch_once: "if not
+                # row['assignee']: continue").
+                inherited_assignee = None
+                child_assignee = conn.execute(
+                    "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if child_assignee and not child_assignee["assignee"]:
+                    for p in parents:
+                        if p["assignee"]:
+                            inherited_assignee = p["assignee"]
+                            break
+
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -2874,16 +2909,31 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
+                    if inherited_assignee:
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready', "
+                            "assignee = ? "
+                            "WHERE id = ? AND status = 'blocked'",
+                            (inherited_assignee, task_id,),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready' "
+                            "WHERE id = ? AND status = 'blocked'",
+                            (task_id,),
+                        )
                 else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                    if inherited_assignee:
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready', assignee = ? "
+                            "WHERE id = ? AND status = 'todo'",
+                            (inherited_assignee, task_id,),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                            (task_id,),
+                        )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
@@ -3785,7 +3835,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
     except Exception:
-        pass  # best-effort — never block completion
+        _log.debug("_cleanup_completed_task best-effort cleanup failed", exc_info=True)
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
@@ -3811,7 +3861,7 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
             )
             _log.debug("Killed stale tmux session: %s", session)
     except Exception:
-        pass  # best-effort — never block completion
+        _log.debug("_cleanup_worker_tmux best-effort cleanup failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3896,7 +3946,7 @@ def _maybe_emit_scratch_tip(
             )
     except Exception:
         # Best-effort — never block the spawn loop over a help message.
-        pass
+        _log.debug("Scratch workspace tip best-effort failed", exc_info=True)
     finally:
         _mark_scratch_tip_shown()
 
@@ -4803,7 +4853,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
-    except Exception:
+    except (ValueError, OSError):
         pass
     return ("unknown", None)
 
@@ -5705,7 +5755,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         return False
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
+    except ImportError:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
@@ -5731,7 +5781,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         return False
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
+    except ImportError:
         return True
     for row in rows:
         if profile_exists(row["assignee"]):
@@ -5932,7 +5982,7 @@ def dispatch_once(
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
         try:
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
+        except ImportError:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
@@ -6066,7 +6116,7 @@ def dispatch_once(
             continue
         try:
             from hermes_cli.profiles import profile_exists
-        except Exception:
+        except ImportError:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
@@ -6141,7 +6191,7 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
             from hermes_cli.config import load_config
 
             kanban_cfg = (load_config().get("kanban") or {})
-        except Exception:
+        except ImportError:
             kanban_cfg = {}
     max_bytes = _positive_int(
         (kanban_cfg or {}).get("worker_log_rotate_bytes"),
@@ -6602,7 +6652,7 @@ def run_daemon(
                 try:
                     on_tick(res)
                 except Exception:
-                    pass
+                    _log.warning("on_tick callback failed", exc_info=True)
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
@@ -6731,7 +6781,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
                     lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
+                except (TypeError, ValueError):
                     pass
             lines.append("")
 
@@ -6771,7 +6821,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 try:
                     meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
+                except (TypeError, ValueError):
                     pass
             lines.extend(body_lines)
             lines.append("")
@@ -7028,7 +7078,7 @@ def unseen_events_for_sub(
     for r in rows:
         try:
             payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             payload = None
         out.append(Event(
             id=r["id"], task_id=r["task_id"], kind=r["kind"],
@@ -7246,7 +7296,7 @@ def list_profiles_on_disk() -> list[str]:
         from hermes_constants import get_default_hermes_root
         default_root = get_default_hermes_root()
         profiles_dir = default_root / "profiles"
-    except Exception:
+    except ImportError:
         return []
 
     names: set[str] = set()

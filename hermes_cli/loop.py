@@ -806,34 +806,14 @@ __all__ = [
     "DEFAULT_MAX_TURNS",
     "MIN_INTERVAL_SECONDS",
     "load_all_loops",
-    "_parse_interval",
-    "_parse_loop_command",
-    "delete_loop",
+    "save_loop",
+    "load_loop",
 ]
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Convenience helpers
 # ──────────────────────────────────────────────────────────────────────
-
-
-def delete_loop(session_id: str, uid: Optional[str] = None) -> bool:
-    """Delete loop(s) from SessionDB without creating a LoopManager.
-
-    If *uid* is None, deletes all loops.  Returns True if anything deleted.
-    """
-    if uid is not None:
-        state = _load_loop(session_id, uid)
-        if state is None:
-            return False
-        _del_loop_meta(session_id, uid)
-        return True
-
-    states = load_all_loops(session_id)
-    if not states:
-        return False
-    _del_all_loop_meta(session_id)
-    return True
 
 
 # Public aliases for external callers (tests, gateway)

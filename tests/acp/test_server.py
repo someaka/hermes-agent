@@ -1694,7 +1694,7 @@ class TestSlashCommands:
         from acp_adapter.server import HermesACPAgent as _ACP
         monkeypatch.setattr(
             _ACP, "_resolve_model_selection",
-            staticmethod(lambda raw, current: ("anthropic", "claude-sonnet-4-6")),
+            lambda raw, current: ("anthropic", "claude-sonnet-4-6"),
         )
         manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
 

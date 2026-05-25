@@ -81,6 +81,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import errno
 import logging
 import time
 from contextvars import ContextVar, Token
@@ -2723,11 +2724,11 @@ def _append_event(
     # Notify any listening TUI gateway via FIFO (event-driven, zero polling).
     # Only fires for notification-worthy event kinds — avoids waking the TUI
     # for internal events like "created", "edited", "heartbeat".
-    _NOTIFY_KINDS = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-    if kind in _NOTIFY_KINDS:
-        try:
-            _fifo_path = os.path.expanduser("~/.hermes/tui_kanban.fifo")
-            if os.path.exists(_fifo_path):
+    _notify_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
+    if kind in _notify_kinds:
+        _fifo_path = os.path.expanduser("~/.hermes/tui_kanban.fifo")
+        if os.path.exists(_fifo_path):
+            try:
                 # O_NONBLOCK: open(2) on a FIFO blocks until a reader
                 # connects; in CI (and any headless context) there is no
                 # reader, so the write op deadlocks the caller.  Non-blocking
@@ -2737,16 +2738,16 @@ def _append_event(
                     _fifo = os.fdopen(_fd, "w", encoding="utf-8")
                     _fifo.write(json.dumps({"task_id": task_id, "kind": kind}) + "\n")
                     _fifo.close()
-                except Exception:
+                except OSError as _e:
+                    _log.debug("kanban_fifo_write_error: %s", _e)
                     os.close(_fd)
-        except OSError as _e:
-            import errno
-            if _e.errno == errno.ENXIO:
-                _log.debug("kanban_fifo_no_reader: no TUI listening on %s", _fifo_path)
-            else:
-                _log.debug("kanban_fifo_open_error: %s", _e)
-        except Exception as _e:
-            _log.debug("kanban_fifo_write_error: %s", _e)
+            except OSError as _e:
+                if _e.errno == errno.ENXIO:
+                    _log.debug("kanban_fifo_no_reader: no TUI listening on %s", _fifo_path)
+                else:
+                    _log.debug("kanban_fifo_open_error: %s", _e)
+            except Exception as _e:
+                _log.debug("kanban_fifo_write_error: %s", _e)
 
 
 def _end_run(

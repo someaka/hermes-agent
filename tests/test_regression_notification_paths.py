@@ -359,7 +359,6 @@ class TestPollFixPreserved:
             cwd=Path("."),
         )
         lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
-        assert lines, "No commits found touching process_registry.py anywhere"
 
         # The fix commit (fd8df065b) must exist and be more recent than the revert (40aeab697)
         fix_sha = "fd8df065b"

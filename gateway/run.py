@@ -6473,20 +6473,22 @@ class GatewayRunner:
 
             timeout = self._restart_drain_timeout
 
-            # NOTE(#27856 follow-up): We intentionally do NOT pre-mark running
-            # sessions as resume_pending before the drain wait.  The original
-            # pre-drain block (removed in fork) pre-marked ALL running sessions
-            # then cleared the markers on clean drain, but this caused
-            # mark_resume_pending to fire on clean drains (violating the test
-            # contract) and to mark sessions that finished during the drain
-            # window (stray resume-interruption notes on their next turn).
-            #
-            # SIGKILL safety is preserved without pre-drain marking: if the
-            # gateway is killed mid-drain, the .clean_shutdown marker is NOT
-            # written, so the next boot's suspend_recently_active() marks those
-            # sessions as resume_pending with reason="restart_interrupted",
-            # which is included in _AUTO_RESUME_REASONS and produces
-            # functionally identical auto-resume behaviour.
+            # Pre-mark sessions as resume_pending BEFORE the drain wait.
+            # If the process is killed by the service manager during the
+            # drain, the durable marker is already written so the next
+            # gateway boot can recover in-flight sessions (#27856).
+            _pre_drain_keys: list[str] = []
+            for _sk, _agent in list(self._running_agents.items()):
+                if _agent is _AGENT_PENDING_SENTINEL:
+                    continue
+                try:
+                    self.session_store.mark_resume_pending(
+                        _sk,
+                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                    )
+                    _pre_drain_keys.append(_sk)
+                except Exception as _e:
+                    logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -6499,6 +6501,20 @@ class GatewayRunner:
                 len(active_agents),
                 self._running_agent_count(),
             )
+
+            if not timed_out:
+                # Drain completed gracefully — all running sessions finished.
+                # Clear the pre-drain resume_pending markers so sessions that
+                # completed during the drain window don't carry a stale flag.
+                for _sk in _pre_drain_keys:
+                    if _sk not in self._running_agents:
+                        try:
+                            self.session_store.clear_resume_pending(_sk)
+                        except Exception as _e:
+                            logger.debug(
+                                "clear_resume_pending after drain failed for %s: %s",
+                                _sk, _e,
+                            )
 
             if timed_out:
                 logger.warning(
@@ -7876,11 +7892,6 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
                 return await self._handle_subgoal_command(event)
 
-            # /loop is safe mid-run — it manages cron schedules (control-plane
-            # only — doesn't interrupt the running turn).
-            if _cmd_def_inner and _cmd_def_inner.name == "loop":
-                return await self._handle_loop_command(event)
-
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
             # the tool-progress display mode for the ongoing stream.
@@ -8290,9 +8301,6 @@ class GatewayRunner:
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
-
-        if canonical == "loop":
-            return await self._handle_loop_command(event)
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
@@ -10334,14 +10342,10 @@ class GatewayRunner:
 
         is_create = action == "create"
 
-        from hermes_cli import kanban as _kanban_mod
-        _kanban_mod._gateway_kanban_in_progress = True
         try:
             output = await asyncio.to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
-        finally:
-            _kanban_mod._gateway_kanban_in_progress = False
 
         # Auto-subscribe on create. Parse the task id from the CLI's standard
         # success line ("Created t_abcd  (ready, assignee=...)"). If the user
@@ -16260,15 +16264,17 @@ class GatewayRunner:
                         _push_fn = getattr(_api_adapter, "push_process_event", None)
                         if _push_fn is not None:
                             try:
-                                delivered = _push_fn({
-                                    "event": "process.completed",
-                                    "session_key": session_key,
-                                    "timestamp": time.time(),
-                                    "session_id": session_id,
-                                    "command": session.command,
-                                    "exit_code": session.exit_code,
-                                    "output": _out,
-                                })
+                                delivered = _push_fn(
+                                    session_key,
+                                    {
+                                        "event": "process.completed",
+                                        "timestamp": time.time(),
+                                        "session_id": session_id,
+                                        "command": session.command,
+                                        "exit_code": session.exit_code,
+                                        "output": _out,
+                                    },
+                                )
                                 if delivered:
                                     logger.info(
                                         "Process %s finished — pushed api_server SSE notification for session %s",

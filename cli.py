@@ -15321,15 +15321,8 @@ class HermesCLI:
                     # aren't missed when the user sends a message.
                     try:
                         from tools.process_registry import process_registry
-                        if not process_registry.completion_queue.empty():
-                            evt = process_registry.completion_queue.get_nowait()
-                            _evt_sid = evt.get("session_id", "")
-                            if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-                                pass  # already delivered via tool result
-                            else:
-                                _synth = format_process_notification(evt)
-                                if _synth:
-                                    self._pending_input.put(_synth)
+                        for _evt, _synth in process_registry.drain_notifications():
+                            self._pending_input.put(_synth)
                     except Exception:
                         pass
 

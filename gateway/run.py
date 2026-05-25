@@ -75,7 +75,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+compression\s+model\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
-    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|preflight\s+compression"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
@@ -330,6 +329,7 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
     return await adapter.send(chat_id, content, metadata=metadata)
+
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
@@ -913,6 +913,7 @@ if _config_path.exists():
                 "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
                 "modal_image": "TERMINAL_MODAL_IMAGE",
                 "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+                "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
                 "ssh_host": "TERMINAL_SSH_HOST",
                 "ssh_user": "TERMINAL_SSH_USER",
                 "ssh_port": "TERMINAL_SSH_PORT",
@@ -2928,212 +2929,6 @@ class GatewayRunner:
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
-
-    def _dispatch_loop_prompt(
-        self,
-        prompt: str,
-        source: "SessionSource",
-    ) -> None:
-        """Dispatch a loop prompt as a synthetic user message.
-
-        Schedules the prompt for agent processing on the gateway's asyncio
-        event loop.  This bypasses ``_enqueue_fifo`` because the TUI and
-        other non-adapter platforms don't have ``_pending_messages``.
-
-        Called from the daemon ticker thread (non-async context), so uses
-        ``asyncio.run_coroutine_threadsafe`` to hand off to the event loop.
-        """
-        loop = getattr(self, "_gateway_loop", None)
-        if loop is None:
-            logger.debug("loop dispatch: no gateway loop available")
-            return
-
-        async def _run():
-            try:
-                event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
-                )
-                _qk = self._session_key_for_source(source)
-                await self._handle_message_with_agent(event, source, _qk, 1)
-            except Exception as exc:
-                logger.debug("loop dispatch: agent run failed: %s", exc)
-
-        try:
-            asyncio.run_coroutine_threadsafe(_run(), loop)
-        except Exception as exc:
-            logger.debug("loop dispatch: schedule failed: %s", exc)
-
-    @staticmethod
-    def _is_loop_continuation_event(event_or_text: Any) -> bool:
-        """Return True for synthetic /loop continuation turns."""
-        text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Loop check]")
-
-    def _clear_loop_pending_continuations(self, session_key: str, adapter: Any) -> int:
-        """Remove queued synthetic /loop continuations for one session."""
-        removed = 0
-        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
-        if isinstance(pending_slot, dict):
-            pending_event = pending_slot.get(session_key)
-            if self._is_loop_continuation_event(pending_event):
-                pending_slot.pop(session_key, None)
-                removed += 1
-
-        queued_events = getattr(self, "_queued_events", None)
-        if isinstance(queued_events, dict):
-            overflow = queued_events.get(session_key) or []
-            if overflow:
-                kept = []
-                for queued_event in overflow:
-                    if self._is_loop_continuation_event(queued_event):
-                        removed += 1
-                    else:
-                        kept.append(queued_event)
-                if kept:
-                    queued_events[session_key] = kept
-                else:
-                    queued_events.pop(session_key, None)
-        return removed
-
-    def _loop_still_active_for_session(self, session_id: str) -> bool:
-        """Best-effort fresh DB check before running a queued loop continuation."""
-        if not session_id:
-            return False
-        try:
-            from hermes_cli.loop import LoopManager
-            return LoopManager(session_id=session_id).is_active()
-        except Exception as exc:
-            logger.debug("loop continuation: active-state recheck failed: %s", exc)
-            return False
-
-    def _get_loop_manager_for_event(self, event: "MessageEvent"):
-        """Return a LoopManager bound to the session for this gateway event.
-
-        Returns ``(manager, session_entry)`` or ``(None, None)``.
-        """
-        try:
-            from hermes_cli.loop import LoopManager
-        except Exception as exc:
-            logger.debug("loop manager unavailable: %s", exc)
-            return None, None
-        try:
-            session_entry = self.session_store.get_or_create_session(event.source)
-        except Exception as exc:
-            logger.debug("loop manager: session lookup failed: %s", exc)
-            return None, None
-        sid = getattr(session_entry, "session_id", None) or ""
-        if not sid:
-            return None, None
-        return LoopManager(session_id=sid), session_entry
-
-    async def _send_loop_status_notice(self, source: Any, message: str) -> None:
-        """Send a /loop status line back to the originating chat/thread."""
-        adapter = self.adapters.get(source.platform)
-        if not adapter:
-            logger.debug("loop continuation: no adapter for %s", getattr(source, "platform", None))
-            return
-
-        try:
-            metadata = self._thread_metadata_for_source(source)
-        except Exception:
-            metadata = None
-
-        result = await adapter.send(source.chat_id, message, metadata=metadata)
-        if result is not None and not getattr(result, "success", True):
-            logger.warning(
-                "loop continuation: status send failed: %s",
-                getattr(result, "error", "unknown error"),
-            )
-
-    async def _defer_loop_status_notice_after_delivery(self, source: Any, message: str) -> None:
-        """Send a /loop status line after the main response is delivered."""
-        adapter = self.adapters.get(source.platform)
-        if not adapter:
-            logger.debug("loop continuation: no adapter for %s", getattr(source, "platform", None))
-            return
-
-        async def _deliver() -> None:
-            try:
-                await self._send_loop_status_notice(source, message)
-            except Exception as exc:
-                logger.warning("loop continuation: status send failed: %s", exc, exc_info=True)
-
-        try:
-            session_key = self._session_key_for_source(source)
-        except Exception:
-            session_key = None
-
-        if session_key and hasattr(adapter, "register_post_delivery_callback"):
-            try:
-                generation = None
-                active = getattr(adapter, "_active_sessions", {}).get(session_key)
-                if active is not None:
-                    generation = getattr(active, "_hermes_run_generation", None)
-                adapter.register_post_delivery_callback(
-                    session_key,
-                    _deliver,
-                    generation=generation,
-                )
-                return
-            except Exception as exc:
-                logger.debug("loop continuation: post-delivery callback registration failed: %s", exc)
-
-        await _deliver()
-
-    async def _post_turn_loop_continuation(
-        self,
-        *,
-        session_entry: Any,
-        source: Any,
-        final_response: str,
-    ) -> None:
-        """Check loop timer and enqueue next turn if interval elapsed.
-
-        The gateway does not run a background scheduler thread (unlike the
-        CLI).  Instead, this post-turn hook reloads the loop state, checks
-        whether the interval has elapsed since last_fired_at, and enqueues
-        the next prompt through the adapter FIFO when ready.
-        """
-        try:
-            from hermes_cli.loop import load_loop, save_loop
-            import time as _t
-        except Exception:
-            return
-
-        if (
-            session_entry is None
-            or not getattr(session_entry, "session_id", None)
-        ):
-            return
-        sid = session_entry.session_id
-
-        state = load_loop(sid)
-        if state is None or state.status != "active":
-            return
-
-        now = _t.time()
-        elapsed = now - state.last_fired_at
-        if state.last_fired_at > 0 and elapsed < state.interval_seconds:
-            return  # not time yet
-
-        # Fire!
-        state.last_fired_at = now
-        state.turns_completed += 1
-        save_loop(sid, state)
-
-        try:
-            self._dispatch_loop_prompt(
-                prompt=state.prompt,
-                source=source,
-            )
-        except Exception as exc:
-            logger.debug("loop continuation dispatch failed: %s", exc)
-
-
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
@@ -3498,44 +3293,6 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
-    @staticmethod
-    def _agent_has_active_subagents(running_agent: Any) -> bool:
-        """Return True when *running_agent* is currently driving subagents
-        via the ``delegate_task`` tool.
-
-        Background (#30170): ``AIAgent.interrupt()`` cascades through the
-        parent's ``_active_children`` list and calls ``interrupt()`` on
-        every child synchronously, which aborts in-flight subagent work
-        and produces a fallback cascade with no actionable signal.
-        Demoting ``busy_input_mode='interrupt'`` to ``queue`` semantics
-        whenever this helper returns True protects subagent work from
-        conversational follow-ups while leaving the explicit ``/stop``
-        path (which goes through ``_interrupt_and_clear_session``)
-        untouched. Safe-by-default: returns False on any attribute or
-        lock error so a missing/broken parent never blocks the existing
-        interrupt path.
-        """
-        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
-            return False
-        children = getattr(running_agent, "_active_children", None)
-        # AIAgent always initialises this as a concrete list (see
-        # agent/agent_init.py). Reject anything that isn't a real
-        # collection — this guards against ``MagicMock()._active_children``
-        # auto-creating a truthy stub in tests and triggering the demotion
-        # against an agent that doesn't actually have subagents.
-        if not isinstance(children, (list, tuple, set)):
-            return False
-        if not children:
-            return False
-        lock = getattr(running_agent, "_active_children_lock", None)
-        try:
-            if lock is not None:
-                with lock:
-                    return bool(children)
-            return bool(children)
-        except Exception:
-            return False
-
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
@@ -3607,25 +3364,6 @@ class GatewayRunner:
         # queueing + interrupting.  If the agent isn't running yet
         # (sentinel) or lacks steer(), or the payload is empty, fall back
         # to queue semantics so nothing is lost.
-        # #30170 — Subagent protection. ``AIAgent.interrupt()`` cascades
-        # to every entry in the parent's ``_active_children`` list and
-        # aborts in-flight ``delegate_task`` work. Demote ``interrupt``
-        # to ``queue`` when the parent is currently driving subagents so
-        # a conversational follow-up doesn't destroy minutes of subagent
-        # work. Explicit ``/stop`` and ``/new`` slash commands go through
-        # ``_interrupt_and_clear_session`` and are unaffected — the
-        # operator still has a way to force-cancel everything.
-        demoted_for_subagents = (
-            effective_mode == "interrupt"
-            and self._agent_has_active_subagents(running_agent)
-        )
-        if demoted_for_subagents:
-            logger.info(
-                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
-                "because the running agent has active subagents (#30170)",
-                session_key,
-            )
-            effective_mode = "queue"
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
@@ -3687,21 +3425,9 @@ class GatewayRunner:
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment. Mobile chat defaults keep this
-        # terse; detailed iteration/tool state is still available in logs and
-        # can be opted in per platform via display.platforms.<platform>.busy_ack_detail.
-        from gateway.display_config import resolve_display_setting
+        # Build a status-rich acknowledgment
         status_parts = []
-        busy_ack_detail_enabled = bool(
-            resolve_display_setting(
-                _load_gateway_config(),
-                _platform_config_key(event.source.platform),
-                "busy_ack_detail",
-                True,
-            )
-        )
-
-        if busy_ack_detail_enabled and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
                 summary = running_agent.get_activity_summary()
                 iteration = summary.get("api_call_count", 0)
@@ -3724,14 +3450,6 @@ class GatewayRunner:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
-            )
-        elif is_queue_mode and demoted_for_subagents:
-            # #30170 — explain the demotion so the user knows their
-            # follow-up didn't accidentally kill the subagent and
-            # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
             )
         elif is_queue_mode:
             message = (
@@ -6672,20 +6390,22 @@ class GatewayRunner:
 
             timeout = self._restart_drain_timeout
 
-            # NOTE(#27856 follow-up): We intentionally do NOT pre-mark running
-            # sessions as resume_pending before the drain wait.  The original
-            # pre-drain block (removed in fork) pre-marked ALL running sessions
-            # then cleared the markers on clean drain, but this caused
-            # mark_resume_pending to fire on clean drains (violating the test
-            # contract) and to mark sessions that finished during the drain
-            # window (stray resume-interruption notes on their next turn).
-            #
-            # SIGKILL safety is preserved without pre-drain marking: if the
-            # gateway is killed mid-drain, the .clean_shutdown marker is NOT
-            # written, so the next boot's suspend_recently_active() marks those
-            # sessions as resume_pending with reason="restart_interrupted",
-            # which is included in _AUTO_RESUME_REASONS and produces
-            # functionally identical auto-resume behaviour.
+            # Pre-mark sessions as resume_pending BEFORE the drain wait.
+            # If the process is killed by the service manager during the
+            # drain, the durable marker is already written so the next
+            # gateway boot can recover in-flight sessions (#27856).
+            _pre_drain_keys: list[str] = []
+            for _sk, _agent in list(self._running_agents.items()):
+                if _agent is _AGENT_PENDING_SENTINEL:
+                    continue
+                try:
+                    self.session_store.mark_resume_pending(
+                        _sk,
+                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                    )
+                    _pre_drain_keys.append(_sk)
+                except Exception as _e:
+                    logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -6698,6 +6418,20 @@ class GatewayRunner:
                 len(active_agents),
                 self._running_agent_count(),
             )
+
+            if not timed_out:
+                # Drain completed gracefully — all running sessions finished.
+                # Clear the pre-drain resume_pending markers so sessions that
+                # completed during the drain window don't carry a stale flag.
+                for _sk in _pre_drain_keys:
+                    if _sk not in self._running_agents:
+                        try:
+                            self.session_store.clear_resume_pending(_sk)
+                        except Exception as _e:
+                            logger.debug(
+                                "clear_resume_pending after drain failed for %s: %s",
+                                _sk, _e,
+                            )
 
             if timed_out:
                 logger.warning(
@@ -7078,7 +6812,7 @@ class GatewayRunner:
                 check_wecom_callback_requirements,
             )
             if not check_wecom_callback_requirements():
-                logger.warning("WeComCallback: aiohttp/httpx/defusedxml not installed")
+                logger.warning("WeComCallback: aiohttp/httpx not installed")
                 return None
             return WecomCallbackAdapter(config)
 
@@ -7095,6 +6829,13 @@ class GatewayRunner:
                 logger.warning("Weixin: aiohttp/cryptography not installed")
                 return None
             return WeixinAdapter(config)
+
+        elif platform == Platform.MATTERMOST:
+            from gateway.platforms.mattermost import MattermostAdapter, check_mattermost_requirements
+            if not check_mattermost_requirements():
+                logger.warning("Mattermost: MATTERMOST_TOKEN or MATTERMOST_URL not set, or aiohttp missing")
+                return None
+            return MattermostAdapter(config)
 
         elif platform == Platform.MATRIX:
             from gateway.platforms.matrix import MatrixAdapter, check_matrix_requirements
@@ -7902,13 +7643,6 @@ class GatewayRunner:
                 if _denied is not None:
                     return _denied
 
-            # Telegram sends /start for bot launches/deep-links. Treat it as a
-            # platform ping, not a user command: no help dump, no agent
-            # interrupt, no queued text.
-            if _cmd_def_inner and _cmd_def_inner.name == "start":
-                logger.info("Ignoring /start platform ping for active session %s", _quick_key)
-                return ""
-
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
@@ -8070,11 +7804,6 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
                 return await self._handle_subgoal_command(event)
 
-            # /loop is safe mid-run — it manages cron schedules (control-plane
-            # only — doesn't interrupt the running turn).
-            if _cmd_def_inner and _cmd_def_inner.name == "loop":
-                return await self._handle_loop_command(event)
-
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
             # the tool-progress display mode for the ongoing stream.
@@ -8198,22 +7927,6 @@ class GatewayRunner:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
-            # #30170 — Subagent protection (PRIORITY path). Same rationale
-            # as ``_handle_active_session_busy_message``: an interrupt
-            # cascades through ``_active_children`` and aborts in-flight
-            # delegate_task work. Demote to queue semantics when the
-            # parent is currently driving subagents so a conversational
-            # follow-up doesn't destroy minutes of subagent progress.
-            # /stop reaches its dedicated handler above, so the operator
-            # still has a clean escape hatch.
-            if self._agent_has_active_subagents(running_agent):
-                logger.info(
-                    "PRIORITY interrupt demoted to queue for session %s "
-                    "because the running agent has active subagents (#30170)",
-                    _quick_key,
-                )
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
@@ -8346,10 +8059,6 @@ class GatewayRunner:
         
         if canonical == "help":
             return await self._handle_help_command(event)
-
-        if canonical == "start":
-            logger.info("Ignoring /start platform ping for session %s", _quick_key)
-            return ""
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
@@ -8499,9 +8208,6 @@ class GatewayRunner:
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
-
-        if canonical == "loop":
-            return await self._handle_loop_command(event)
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
@@ -10543,14 +10249,10 @@ class GatewayRunner:
 
         is_create = action == "create"
 
-        from hermes_cli import kanban as _kanban_mod
-        _kanban_mod._gateway_kanban_in_progress = True
         try:
             output = await asyncio.to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
-        finally:
-            _kanban_mod._gateway_kanban_in_progress = False
 
         # Auto-subscribe on create. Parse the task id from the CLI's standard
         # success line ("Created t_abcd  (ready, assignee=...)"). If the user
@@ -11503,21 +11205,7 @@ class GatewayRunner:
                         cfg = yaml.safe_load(f) or {}
                 else:
                     cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
+                model_cfg = cfg.setdefault("model", {})
                 model_cfg["default"] = result.new_model
                 model_cfg["provider"] = result.target_provider
                 if result.base_url:
@@ -12649,127 +12337,6 @@ class GatewayRunner:
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
-
-    async def _handle_loop_command(self, event: MessageEvent) -> str:
-        """Handle /loop — manage recurring scheduled prompts via the cron system.
-
-        Subcommands: list, pause, resume, remove.
-        Default: /loop <schedule> <prompt> creates a new loop job.
-        No args: shows usage and current loop jobs.
-        """
-        import asyncio
-        import json
-        from tools.cronjob_tools import cronjob
-
-        # Strip /loop or loop prefix from event text
-        text = (event.text or "").strip()
-        if text.startswith("/"):
-            text = text.lstrip("/")
-        if text.startswith("loop"):
-            text = text[len("loop"):].lstrip()
-
-        # No args → usage + list
-        if not text:
-            usage = (
-                "*/loop <schedule> <prompt>*\n"
-                "Subcommands: `list`, `pause <id>`, `resume <id>`, `remove <id>`\n"
-                "Example: `/loop 30m check deployment status`"
-            )
-            result = await asyncio.to_thread(cronjob, action="list", include_disabled=True)
-            data = json.loads(result)
-            jobs = [j for j in data.get("jobs", []) if j.get("name", "").startswith("loop:")]
-            if jobs:
-                lines = [f"{len(jobs)} loop job(s):"]
-                for j in jobs:
-                    state = j.get("state", "active")
-                    icon = "\u25b6" if state == "active" else "\u23f8"
-                    lines.append(
-                        f"{icon} `{j['job_id']}` \u2014 {j.get('schedule', '?')} \u2014 {j.get('name', '')}"
-                    )
-                return usage + "\n\n" + "\n".join(lines)
-            return usage + "\n\nNo loop jobs"
-
-        parts = text.split(None, 1)
-        sub = parts[0].lower()
-
-        # /loop list — filter jobs by loop: prefix
-        if sub == "list":
-            result = await asyncio.to_thread(cronjob, action="list", include_disabled=True)
-            data = json.loads(result)
-            jobs = [j for j in data.get("jobs", []) if j.get("name", "").startswith("loop:")]
-            if not jobs:
-                return "No loop jobs found"
-            lines = ["*Loop Jobs:*"]
-            for j in jobs:
-                state = j.get("state", "active")
-                icon = "\u25b6" if state == "active" else "\u23f8"
-                lines.append(
-                    f"{icon} `{j['job_id']}` \u2014 {j.get('schedule', '?')} \u2014 {j.get('name', '')}"
-                )
-            return "\n".join(lines)
-
-        # /loop pause <id>
-        if sub == "pause":
-            if len(parts) < 2 or not parts[1].strip():
-                return "Usage: `/loop pause <job_id>`"
-            job_id = parts[1].strip().split()[0]
-            result = await asyncio.to_thread(
-                cronjob, action="pause", job_id=job_id, reason="paused from /loop"
-            )
-            data = json.loads(result)
-            if data.get("success"):
-                name = data.get("job", {}).get("name", job_id)
-                return f"\u23f8 Paused loop job `{name}`"
-            return f"Failed to pause: {data.get('error', 'unknown')}"
-
-        # /loop resume <id>
-        if sub == "resume":
-            if len(parts) < 2 or not parts[1].strip():
-                return "Usage: `/loop resume <job_id>`"
-            job_id = parts[1].strip().split()[0]
-            result = await asyncio.to_thread(cronjob, action="resume", job_id=job_id)
-            data = json.loads(result)
-            if data.get("success"):
-                name = data.get("job", {}).get("name", job_id)
-                next_run = data.get("job", {}).get("next_run_at", "")
-                msg = f"\u25b6 Resumed loop job `{name}`"
-                if next_run:
-                    msg += f"\nNext run: {next_run}"
-                return msg
-            return f"Failed to resume: {data.get('error', 'unknown')}"
-
-        # /loop remove <id>
-        if sub == "remove":
-            if len(parts) < 2 or not parts[1].strip():
-                return "Usage: `/loop remove <job_id>`"
-            job_id = parts[1].strip().split()[0]
-            result = await asyncio.to_thread(cronjob, action="remove", job_id=job_id)
-            data = json.loads(result)
-            if data.get("success"):
-                name = data.get("removed_job", {}).get("name", job_id)
-                return f"\U0001f5d1 Removed loop job `{name}`"
-            return f"Failed to remove: {data.get('error', 'unknown')}"
-
-        # Default: /loop <schedule> <prompt>
-        schedule = sub
-        if len(parts) < 2 or not parts[1].strip():
-            return "Usage: `/loop <schedule> <prompt>`\nExample: `/loop 30m check deployment status`"
-        prompt = parts[1].strip()
-        name = f"loop: {prompt}"
-        result = await asyncio.to_thread(
-            cronjob, action="create", schedule=schedule, prompt=prompt,
-            name=name, deliver="origin"
-        )
-        data = json.loads(result)
-        if data.get("success"):
-            job_id = data.get("job_id", "")
-            sched = data.get("schedule", schedule)
-            next_run = data.get("next_run_at", "")
-            msg = f"\u2705 Loop job created\n`{job_id}` \u2014 every {sched}"
-            if next_run:
-                msg += f"\nNext run: {next_run}"
-            return msg
-        return f"\u26a0 Failed to create loop: {data.get('error', 'unknown')}"
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
@@ -14141,16 +13708,6 @@ class GatewayRunner:
         session_key = self._session_key_for_source(source)
         name = event.get_command_args().strip()
 
-        # Strip common outer brackets/quotes users may type literally from the
-        # usage hint (e.g. ``/resume <abc123>``). Mirrors the CLI behavior.
-        if len(name) >= 2 and (
-            (name[0] == "<" and name[-1] == ">")
-            or (name[0] == "[" and name[-1] == "]")
-            or (name[0] == '"' and name[-1] == '"')
-            or (name[0] == "'" and name[-1] == "'")
-        ):
-            name = name[1:-1].strip()
-
         def _list_titled_sessions() -> list[dict]:
             user_source = source.platform.value if source.platform else None
             sessions = self._session_db.list_sessions_rich(source=user_source, limit=10)
@@ -14188,13 +13745,7 @@ class GatewayRunner:
             target_id = target.get("id")
             name = target.get("title") or name
         else:
-            # Try direct session ID lookup first (so `/resume <session_id>`
-            # works in the gateway, not just `/resume <title>`).
-            session = self._session_db.get_session(name)
-            if session:
-                target_id = session["id"]
-            else:
-                target_id = self._session_db.resolve_session_by_title(name)
+            target_id = self._session_db.resolve_session_by_title(name)
         if not target_id:
             return t("gateway.resume.not_found", name=name)
         # Compression creates child continuations that hold the live transcript.
@@ -14624,40 +14175,6 @@ class GatewayRunner:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
                 lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(connected_servers)))
-
-            # Refresh cached agents so existing sessions see new MCP tools on
-            # their next turn — without this, the user has to `/new` (which
-            # discards conversation history) to pick up tools from a server
-            # that was just added or reconnected. The user has already
-            # consented to the prompt-cache invalidation via the slash-confirm
-            # gate in _handle_reload_mcp_command before we reach this point.
-            try:
-                from model_tools import get_tool_definitions
-                _cache = getattr(self, "_agent_cache", None)
-                _cache_lock = getattr(self, "_agent_cache_lock", None)
-                if _cache_lock is not None and _cache:
-                    with _cache_lock:
-                        for _sess_key, _entry in list(_cache.items()):
-                            try:
-                                _agent = _entry[0] if isinstance(_entry, tuple) else _entry
-                            except Exception:
-                                continue
-                            if _agent is None:
-                                continue
-                            new_defs = get_tool_definitions(
-                                enabled_toolsets=getattr(_agent, "enabled_toolsets", None),
-                                disabled_toolsets=getattr(_agent, "disabled_toolsets", None),
-                                quiet_mode=True,
-                            )
-                            _agent.tools = new_defs
-                            _agent.valid_tool_names = {
-                                t["function"]["name"] for t in new_defs
-                            } if new_defs else set()
-            except Exception as _exc:
-                logger.debug(
-                    "Failed to update cached agent tools after MCP reload: %s",
-                    _exc,
-                )
 
             # Inject a message at the END of the session history so the
             # model knows tools changed on its next turn.  Appended after
@@ -16320,15 +15837,17 @@ class GatewayRunner:
                         _push_fn = getattr(_api_adapter, "push_process_event", None)
                         if _push_fn is not None:
                             try:
-                                delivered = _push_fn({
-                                    "event": "process.completed",
-                                    "session_key": session_key,
-                                    "timestamp": time.time(),
-                                    "session_id": session_id,
-                                    "command": session.command,
-                                    "exit_code": session.exit_code,
-                                    "output": _out,
-                                })
+                                delivered = _push_fn(
+                                    session_key,
+                                    {
+                                        "event": "process.completed",
+                                        "timestamp": time.time(),
+                                        "session_id": session_id,
+                                        "command": session.command,
+                                        "exit_code": session.exit_code,
+                                        "output": _out,
+                                    },
+                                )
                                 if delivered:
                                     logger.info(
                                         "Process %s finished — pushed api_server SSE notification for session %s",
@@ -17356,13 +16875,9 @@ class GatewayRunner:
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
-            and bool(
-                resolve_display_setting(
-                    user_config,
-                    platform_key,
-                    "interim_assistant_messages",
-                    True,
-                )
+            and is_truthy_value(
+                display_config.get("interim_assistant_messages"),
+                default=True,
             )
         )
         
@@ -18898,15 +18413,6 @@ class GatewayRunner:
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        if not bool(
-            resolve_display_setting(
-                user_config,
-                platform_key,
-                "long_running_notifications",
-                True,
-            )
-        ):
-            _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
         async def _notify_long_running():

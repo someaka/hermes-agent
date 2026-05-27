@@ -5052,22 +5052,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     session["running"] = False
 
         # Drain pending kanban notifications that were queued while the
-        # session was busy. Process them now that the session is idle.
-        while True:
-            with session["history_lock"]:
-                _pending = session.get("_pending_kanban", [])
-                if not _pending:
-                    break
-                _next_msg = _pending.pop(0)
-                if session.get("running"):
-                    # Another turn started (user prompt or goal followup)
-                    # — put it back and stop draining.
-                    _pending.insert(0, _next_msg)
-                    break
+        # session was busy.  Batch ALL pending into a single combined
+        # message so one user-message mid-drain doesn't orphan the rest.
+        with session["history_lock"]:
+            _pending = session.get("_pending_kanban", [])
+            if _pending and not session.get("running"):
+                _batch = "\n\n".join(_pending)
+                _pending.clear()
                 session["running"] = True
+            else:
+                _batch = None
+        if _batch:
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, _next_msg)
+                _run_prompt_submit(rid, sid, session, _batch)
             except Exception as _pk_exc:
                 print(
                     f"[tui_gateway] pending kanban dispatch failed: "

@@ -359,12 +359,14 @@ def _install_root() -> Path:
 def _run_bootstrap(cwd: Path, commands: List[str]) -> None:
     """Execute bootstrap commands in *cwd*. Raise CatalogError on first failure.
 
-    Each command runs through the shell (so `&&` etc. work). The output is
-    streamed to the user's terminal for visibility.
+    Each command is split via shlex and run without shell=True to avoid
+    injection from untrusted YAML catalog entries. Shell operators like
+    ``&&`` are not supported — use separate command entries instead.
     """
+    import shlex
     for cmd in commands:
         print(color(f"  $ {cmd}", Colors.DIM))
-        proc = subprocess.run(cmd, cwd=str(cwd), shell=True)
+        proc = subprocess.run(shlex.split(cmd), cwd=str(cwd), shell=False)
         if proc.returncode != 0:
             raise CatalogError(
                 f"bootstrap step failed (exit {proc.returncode}): {cmd}"

@@ -9332,12 +9332,13 @@ class HermesCLI:
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
-                    import subprocess, shlex as _shlex
+                    import subprocess
+                    import shlex
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
                             result = subprocess.run(
-                                _shlex.split(exec_cmd), shell=False,
+                                shlex.split(exec_cmd), shell=False,
                                 capture_output=True,
                                 text=True, timeout=30
                             )

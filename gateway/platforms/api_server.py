@@ -553,7 +553,6 @@ def _sanitize_error_msg(exc: Exception, max_len: int = 200) -> str:
     Truncates long messages and strips absolute paths to avoid leaking
     internal filesystem layout or stack details to external clients.
     """
-    import re
     msg = str(exc)
     # Strip absolute paths (Unix and Windows)
     msg = re.sub(r'/(?:[\w.-]+/)+[\w.-]+', '<path>', msg)

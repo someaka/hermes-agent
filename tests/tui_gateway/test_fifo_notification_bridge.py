@@ -4,7 +4,7 @@ Tests both sides of the zero-polling FIFO bridge:
   - Writer side (hermes_cli/kanban_db.py _append_event): writes JSON lines
     to ~/.hermes/tui_kanban.fifo for notification-worthy event kinds.
   - Reader side (tui_gateway/server.py): _format_kanban_notification formats
-    events correctly; _start_kanban_fifo_reader reads from FIFO and dispatches.
+    events correctly; _start_kanban_event_reader reads from DB poller and dispatches.
 """
 
 from __future__ import annotations
@@ -458,24 +458,24 @@ class TestFifoReaderEdgeCases:
         """When queue is full, notifications should be dropped and counted."""
         srv = self.server
         # Fill the queue to capacity
-        for i in range(srv._kanban_fifo_queue.maxsize):
-            srv._kanban_fifo_queue.put({"task_id": f"t_{i}", "kind": "completed"}, block=False)
+        for i in range(srv._kanban_event_queue.maxsize):
+            srv._kanban_event_queue.put({"task_id": f"t_{i}", "kind": "completed"}, block=False)
 
         # Reset drop counter
-        srv._kanban_fifo_dropped_count = 0
+        srv._kanban_event_dropped_count = 0
 
         # Now put one more — should drop
         with pytest.raises(queue.Full):
-            srv._kanban_fifo_queue.put({"task_id": "t_overflow", "kind": "completed"}, block=False)
+            srv._kanban_event_queue.put({"task_id": "t_overflow", "kind": "completed"}, block=False)
 
         # The reader would normally catch queue.Full and increment the counter.
         # Verify the counter exists and can be incremented.
-        srv._kanban_fifo_dropped_count += 1
-        assert srv._kanban_fifo_dropped_count == 1
+        srv._kanban_event_dropped_count += 1
+        assert srv._kanban_event_dropped_count == 1
 
     def test_metrics_function_returns_expected_keys(self):
-        """get_kanban_fifo_metrics should return all expected keys."""
-        metrics = self.server.get_kanban_fifo_metrics()
+        """get_kanban_event_metrics should return all expected keys."""
+        metrics = self.server.get_kanban_event_metrics()
         assert "queue_depth" in metrics
         assert "queue_maxsize" in metrics
         assert "dropped_count" in metrics
@@ -487,8 +487,8 @@ class TestFifoReaderEdgeCases:
     def test_queue_not_empty_after_put(self):
         """Putting items in the queue should increase its size."""
         srv = self.server
-        srv._kanban_fifo_queue.put({"task_id": "t_test", "kind": "completed"}, block=False)
-        assert srv._kanban_fifo_queue.qsize() >= 1
+        srv._kanban_event_queue.put({"task_id": "t_test", "kind": "completed"}, block=False)
+        assert srv._kanban_event_queue.qsize() >= 1
 
 
 class TestFifoDispatchEdgeCases:
@@ -525,7 +525,7 @@ class TestFifoDispatchEdgeCases:
                 srv._dispatch_kanban_notification("sid-1", session, {"task_id": "t_test"})
 
         # dispatch_failures counter should be incremented
-        assert srv._kanban_fifo_dispatch_failures >= 1
+        assert srv._kanban_event_dispatch_failures >= 1
 
     def test_dispatch_empty_task_id_returns_early(self):
         """When data has no task_id, dispatch should return immediately."""

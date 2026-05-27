@@ -81,9 +81,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import errno
 import logging
-import stat
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -2721,19 +2719,8 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
-
-    # Notify any listening TUI gateway via FIFO (event-driven, zero polling).
-    # Only fires for notification-worthy event kinds — avoids waking the TUI
-    # for internal events like "created", "edited", "heartbeat".
-    #
-    # The actual FIFO write is deferred to _flush_pending_fifo_writes(),
-    # which runs after COMMIT in write_txn.  Writing before commit creates a
-    # race: the TUI reader sees the event immediately but the event row is
-    # not yet visible to other connections (the query in
-    # _dispatch_kanban_notification returns nothing).
-    _notify_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-    if kind in _notify_kinds:
-        _pending_fifo_writes.append((task_id, kind))
+    # Event is now in task_events. The TUI gateway's DB poller will
+    # pick it up after COMMIT (write_txn handles the commit).
 
 
 def _end_run(

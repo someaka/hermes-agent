@@ -136,102 +136,95 @@ _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
 # ── Kanban→TUI notification FIFO (event-driven, zero polling) ─────────
-_KANBAN_FIFO_PATH = os.path.expanduser("~/.hermes/tui_kanban.fifo")
-
-# Global queue decouples FIFO reader from session dispatch.
-# The reader thread is eager (starts at import) and immortal.
+# Global queue decouples DB poller from session dispatch.
+# The poller thread is eager (starts at import) and immortal.
 _kanban_fifo_queue: queue.Queue = queue.Queue(maxsize=10000)
-_kanban_global_reader_thread: threading.Thread | None = None
+_kanban_global_poller_thread: threading.Thread | None = None
 
 # Module-level metrics counters for operational visibility.
 _kanban_fifo_dropped_count: int = 0
 _kanban_fifo_received_count: int = 0
 _kanban_fifo_dispatch_failures: int = 0
 
-# Create FIFO on import (idempotent). Clean up at exit so stale FIFOs
-# don't block future TUI starts (open() on a stale FIFO blocks forever).
-try:
-    os.mkfifo(_KANBAN_FIFO_PATH, 0o600)
-except FileExistsError:
-    pass  # Leftover from prior run — safe to reuse
-except Exception:
-    pass  # FIFO not available on this platform (e.g. Windows)
+# Terminal event kinds that trigger TUI notifications.
+_KANBAN_TERMINAL_KINDS = frozenset(
+    {"completed", "blocked", "gave_up", "crashed", "timed_out"}
+)
 
 
-def _cleanup_kanban_fifo() -> None:
-    try:
-        if os.path.exists(_KANBAN_FIFO_PATH):
-            os.unlink(_KANBAN_FIFO_PATH)
-    except Exception:
-        pass
+def _start_global_kanban_db_poller() -> threading.Thread:
+    """Start the global kanban DB poller thread (idempotent, eager).
 
+    Polls ``task_events`` for new terminal events and pushes them into
+    ``_kanban_fifo_queue``.  Each session's notification poller drains
+    the queue for matching subscriptions.
 
-atexit.register(_cleanup_kanban_fifo)
-
-
-def _start_global_kanban_reader() -> threading.Thread:
-    """Start the global kanban FIFO reader thread (idempotent, eager).
-
-    Reads JSON lines from the FIFO and pushes parsed dicts into
-    _kanban_fifo_queue.  Each session's notification poller drains
-    the queue for matching subscriptions.  This ensures the FIFO
-    always has a reader — eliminating ENXIO races — and notifications
-    survive gateway restart (they queue until a session starts).
+    Replaces the old FIFO-based reader which was fragile:
+    - ``atexit`` cleanup deleted the FIFO while the gateway was still running
+    - Reader thread silently died on FIFO deletion, leaving no notifier
+    - Multiple gateway restarts created race conditions on FIFO lifecycle
     """
-    global _kanban_global_reader_thread
+    global _kanban_global_poller_thread
     if (
-        _kanban_global_reader_thread is not None
-        and _kanban_global_reader_thread.is_alive()
+        _kanban_global_poller_thread is not None
+        and _kanban_global_poller_thread.is_alive()
     ):
-        return _kanban_global_reader_thread
+        return _kanban_global_poller_thread
 
-    def _reader() -> None:
+    def _poller() -> None:
+        global _kanban_fifo_received_count, _kanban_fifo_dropped_count
+        _last_event_id = 0
+        _conn = None
+
         while True:
             try:
-                with open(_KANBAN_FIFO_PATH, "r", encoding="utf-8") as _fifo:
-                    for _line in _fifo:
-                        _line = _line.strip()
-                        if not _line:
-                            continue
-                        try:
-                            _data = json.loads(_line)
-                            _kanban_fifo_queue.put(_data, block=False)
-                            global _kanban_fifo_received_count
-                            _kanban_fifo_received_count += 1
-                        except queue.Full:
-                            global _kanban_fifo_dropped_count
-                            _kanban_fifo_dropped_count += 1
-                            logger.debug(
-                                "kanban_fifo_queue full; dropped notification"
-                            )
-                        except json.JSONDecodeError:
-                            logger.debug(
-                                "kanban_fifo_reader: bad JSON line", exc_info=True
-                            )
-            except (OSError, IOError):
-                # FIFO removed or TUI shutting down — recreate if missing
-                # so future writers can connect.
-                if not os.path.exists(_KANBAN_FIFO_PATH):
+                # Lazy import to avoid circular deps at module load time.
+                if _conn is None:
                     try:
-                        os.mkfifo(_KANBAN_FIFO_PATH, 0o600)
+                        from hermes_cli import kanban_db as _kb
+                        _conn = _kb.connect()
                     except Exception:
-                        logger.warning(
-                            "kanban_fifo_reader: failed to recreate FIFO",
-                            exc_info=True,
-                        )
-                time.sleep(0.5)
-            except Exception:
-                logger.exception("kanban_fifo_reader_error")
-                time.sleep(1.0)
+                        logger.debug("kanban_db_poller: cannot connect, retrying")
+                        time.sleep(5.0)
+                        continue
 
-    _t = threading.Thread(target=_reader, daemon=True, name="kanban-fifo-global")
+                _rows = _conn.execute(
+                    "SELECT id, task_id, kind FROM task_events "
+                    "WHERE id > ? AND kind IN ({}) "
+                    "ORDER BY id LIMIT 100".format(
+                        ",".join("?" for _ in _KANBAN_TERMINAL_KINDS)
+                    ),
+                    (_last_event_id, *_KANBAN_TERMINAL_KINDS),
+                ).fetchall()
+
+                for _row in _rows:
+                    _eid, _tid, _kind = _row
+                    _data = {"task_id": _tid, "kind": _kind}
+                    try:
+                        _kanban_fifo_queue.put(_data, block=False)
+                        _kanban_fifo_received_count += 1
+                    except queue.Full:
+                        _kanban_fifo_dropped_count += 1
+                        logger.debug(
+                            "kanban_db_poller: queue full, dropped notification"
+                        )
+                    _last_event_id = _eid
+
+                time.sleep(2.0)
+
+            except Exception:
+                logger.debug("kanban_db_poller error, reconnecting", exc_info=True)
+                _conn = None
+                time.sleep(3.0)
+
+    _t = threading.Thread(target=_poller, daemon=True, name="kanban-db-poller")
     _t.start()
-    _kanban_global_reader_thread = _t
+    _kanban_global_poller_thread = _t
     return _t
 
 
-# Eager start: the FIFO always has a reader as long as the gateway process lives.
-_start_global_kanban_reader()
+# Eager start: the DB poller always runs as long as the gateway process lives.
+_start_global_kanban_db_poller()
 
 
 def _format_kanban_notification(ev, sub) -> "str | None":
@@ -384,18 +377,18 @@ def _dispatch_kanban_notification(sid: str, session: dict, data: dict) -> None:
 
 
 def _start_kanban_fifo_reader(sid: str, session: dict) -> threading.Thread:
-    """Ensure the global kanban FIFO reader is running.
+    """Ensure the global kanban DB poller is running.
 
-    Per-session FIFO readers are replaced by a single global reader
+    Per-session readers are replaced by a single global poller
     that feeds a shared queue.  Each session's notification poller
     drains the queue for matching subscriptions.  This function is
     kept for backward compatibility at existing call sites.
     """
-    return _start_global_kanban_reader()
+    return _start_global_kanban_db_poller()
 
 
 def get_kanban_fifo_metrics() -> dict:
-    """Return operational metrics for the kanban FIFO notification bridge."""
+    """Return operational metrics for the kanban notification bridge."""
     return {
         "queue_depth": _kanban_fifo_queue.qsize(),
         "queue_maxsize": _kanban_fifo_queue.maxsize,
@@ -403,13 +396,13 @@ def get_kanban_fifo_metrics() -> dict:
         "received_count": _kanban_fifo_received_count,
         "dispatch_failures": _kanban_fifo_dispatch_failures,
         "reader_alive": (
-            _kanban_global_reader_thread.is_alive()
-            if _kanban_global_reader_thread is not None
+            _kanban_global_poller_thread.is_alive()
+            if _kanban_global_poller_thread is not None
             else False
         ),
         "reader_name": (
-            _kanban_global_reader_thread.name
-            if _kanban_global_reader_thread is not None
+            _kanban_global_poller_thread.name
+            if _kanban_global_poller_thread is not None
             else None
         ),
     }

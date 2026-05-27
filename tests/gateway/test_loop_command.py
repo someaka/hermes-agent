@@ -259,10 +259,21 @@ class TestLoopCommandGateway:
         runner = _make_runner()
 
         with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(success=False, error="Invalid schedule")):
-            result = await runner._handle_loop_command(_make_event("/loop bad check deployment"))
+            result = await runner._handle_loop_command(_make_event("/loop 5m check deployment"))
 
         assert "⚠ Failed to create loop" in result
         assert "Invalid schedule" in result
+
+    @pytest.mark.asyncio
+    async def test_unknown_subcommand_rejected(self):
+        """Unknown subcommand returns usage error, not a silent create."""
+        runner = _make_runner()
+
+        with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api()):
+            result = await runner._handle_loop_command(_make_event("/loop foobar"))
+
+        assert "Unknown subcommand" in result
+        assert "foobar" in result
 
     @pytest.mark.asyncio
     async def test_strip_loop_prefix_variants(self):

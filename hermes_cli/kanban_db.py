@@ -81,9 +81,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import errno
 import logging
-import stat
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -2767,62 +2765,8 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
-    # Event is now in task_events.  After the enclosing write_txn
-    # commits, callers should invoke _notify_kanban_event() to push
-    # terminal events into the in-process completion_queue so the TUI
-    # poller and CLI drain pick them up immediately (event-driven,
-    # no DB polling).
-
-
-# Terminal event kinds that should trigger user-facing notifications.
-KANBAN_TERMINAL_KINDS = frozenset({
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
-})
-
-
-def _notify_kanban_event(
-    task_id: str,
-    kind: str,
-    payload: Optional[dict] = None,
-) -> None:
-    """Push a kanban event into the in-process completion_queue.
-
-    Call this AFTER the enclosing write_txn has committed.  Only fires
-    for terminal event kinds (completed, blocked, gave_up, crashed,
-    timed_out) — internal events like "created", "edited", "heartbeat"
-    are skipped.
-
-    The completion_queue is the same one used by
-    ``process_registry`` for background-process notifications.
-    The TUI adapter and CLI's
-    ``drain_notifications()`` already drain it, so kanban events
-    are delivered with zero additional polling.
-    """
-    if kind not in KANBAN_TERMINAL_KINDS:
-        return
-    try:
-        from tools.process_registry import process_registry
-        process_registry.completion_queue.put({
-            "type": "kanban_event",
-            "task_id": task_id,
-            "kind": kind,
-            "payload": payload or {},
-        })
-    except Exception:
-        pass  # non-fatal — DB is source of truth, queue is optimization
-
-    # Notify any listening TUI gateway via FIFO (event-driven, zero polling).
-    # Only fires for notification-worthy event kinds — avoids waking the TUI
-    # for internal events like "created", "edited", "heartbeat".
-    #
-    # The actual FIFO write is deferred to _flush_pending_fifo_writes(),
-    # which runs after COMMIT in write_txn.  Writing before commit creates a
-    # race: the TUI reader sees the event immediately but the event row is
-    # not yet visible to other connections (the query in
-    # _dispatch_kanban_notification returns nothing).
-    _notify_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-    if kind in _notify_kinds:
-        _pending_fifo_writes.append((task_id, kind))
+    # Event is now in task_events. The TUI gateway's DB poller will
+    # pick it up after COMMIT (write_txn handles the commit).
 
 
 def _end_run(

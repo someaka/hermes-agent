@@ -11965,6 +11965,31 @@ class GatewayRunner:
                 return f"\U0001f5d1 Removed loop job `{name}`"
             return f"Failed to remove: {data.get('error', 'unknown')}"
 
+        # /loop clear — remove ALL loop jobs
+        if sub == "clear":
+            result = await asyncio.to_thread(cronjob, action="list", include_disabled=True)
+            data = json.loads(result)
+            jobs = [j for j in data.get("jobs", []) if j.get("name", "").startswith("loop:")]
+            if not jobs:
+                return "No loop jobs to clear."
+            removed = 0
+            for j in jobs:
+                r = await asyncio.to_thread(cronjob, action="remove", job_id=j["job_id"])
+                d = json.loads(r)
+                if d.get("success"):
+                    removed += 1
+            return f"\U0001f5d1 Cleared {removed}/{len(jobs)} loop job(s)."
+
+        # Validate: known subcommands are list/pause/resume/remove/clear
+        # Anything else must be a schedule expression for creating a loop.
+        # Reject bare words that don't look like schedules.
+        from hermes_cli.loop import _parse_interval
+        if _parse_interval(sub) is None:
+            return (
+                f"Unknown subcommand: `{sub}`\n"
+                "Usage: `/loop <schedule> <prompt>` or /loop list | pause | resume | remove | clear"
+            )
+
         # Default: /loop <schedule> <prompt>
         schedule = sub
         if len(parts) < 2 or not parts[1].strip():

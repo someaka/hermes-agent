@@ -8367,6 +8367,7 @@ class HermesCLI:
             _cprint('    /loop pause <job_id>          Pause a loop job')
             _cprint('    /loop resume <job_id>         Resume a paused loop job')
             _cprint('    /loop remove <job_id>         Delete a loop job')
+            _cprint('    /loop clear                   Delete ALL loop jobs')
             _cprint("")
             _cprint("  Schedules:  5m, 30m, 2h, 1d, every 5m, every 2h, 0 9 * * *")
             _cprint("")
@@ -8453,6 +8454,22 @@ class HermesCLI:
                 _cprint(f"(^_^)b Removed loop job: {result.get('removed_job', {}).get('name', job_id)}")
             else:
                 _cprint(f"(x_x) Failed to remove: {result.get('error')}")
+            return
+
+        # /loop clear — remove ALL loop jobs
+        if subcommand == "clear":
+            result = _cron_api(action="list", include_disabled=True)
+            jobs = result.get("jobs", []) if result.get("success") else []
+            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
+            if not loop_jobs:
+                _cprint("(._.) No loop jobs to clear.")
+                return
+            removed = 0
+            for j in loop_jobs:
+                r = _cron_api(action="remove", job_id=j["job_id"])
+                if r.get("success"):
+                    removed += 1
+            _cprint(f"(^_^)b Cleared {removed}/{len(loop_jobs)} loop job(s).")
             return
 
         # /loop <schedule> <prompt>  (create)
@@ -9558,50 +9575,6 @@ class HermesCLI:
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         self._goal_manager = mgr
         return mgr
-
-    def _get_loop_manager(self):
-        """Return the LoopManager bound to the current session_id.
-
-        Cached on ``self._loop_manager`` and rebound lazily when
-        ``session_id`` changes.
-        """
-        try:
-            from hermes_cli.loop import LoopManager
-        except Exception as exc:
-            logging.debug("loop manager unavailable: %s", exc)
-            return None
-
-        sid = getattr(self, "session_id", None) or ""
-        if not sid:
-            return None
-
-        existing = getattr(self, "_loop_manager", None)
-        if existing is not None and getattr(existing, "session_id", None) == sid:
-            return existing
-
-        # Slash_worker is an ephemeral subprocess — persist only,
-        # no scheduler (the TUI gateway creates its own LoopManager).
-        _is_slash_worker = (
-            "HERMES_SLASH_WORKER" in os.environ
-            or "HERMES_SESSION_KEY" in os.environ
-        )
-        dispatch = None if _is_slash_worker else self._make_loop_dispatch()
-
-        mgr = LoopManager(session_id=sid, dispatch=dispatch)
-        self._loop_manager = mgr
-        return mgr
-
-    def _make_loop_dispatch(self) -> Callable[[str], bool]:
-        """Return a dispatch callback for the CLI's input queue."""
-        def _dispatch(prompt: str) -> bool:
-            if getattr(self, "_agent_running", False):
-                return False  # busy, retry next tick
-            try:
-                self._pending_input.put(prompt)
-                return True
-            except Exception:
-                return False
-        return _dispatch
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / status / pause / resume / clear."""
@@ -15383,13 +15356,6 @@ class HermesCLI:
                     )
                 except Exception:
                     pass
-            # Stop loop scheduler if running
-            try:
-                loop_mgr = self._get_loop_manager()
-                if loop_mgr is not None:
-                    loop_mgr.shutdown()
-            except Exception:
-                pass
             _run_cleanup()
             self._print_exit_summary()
 

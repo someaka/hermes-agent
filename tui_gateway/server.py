@@ -5694,7 +5694,7 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _err(rid, 4001, "no active session")
         try:
-            from hermes_cli.loop import LoopManager, _parse_loop_command
+            from hermes_cli.loop import LoopManager, _parse_loop_command, format_interval
         except Exception as exc:
             return _err(rid, 5030, f"loop unavailable: {exc}")
 
@@ -5765,14 +5765,18 @@ def _(rid, params: dict) -> dict:
             except ValueError as exc:
                 return _err(rid, 4004, f"invalid loop: {exc}")
 
+            interval_str = format_interval(state.interval_seconds)
             notice = (
-                f"⊙ Loop #{state.id} set: every {state.interval_seconds}s → {state.prompt}\n"
-                "Controls: /loop list · /loop status · /loop pause · /loop resume · /loop clear"
+                f"⊙ Loop #{state.id} set: every {interval_str} → {state.prompt}\n"
+                "Controls: /loop list · /loop pause · /loop resume · /loop clear"
             )
             return _ok(
                 rid,
                 {"type": "exec", "output": notice},
             )
+
+        if action == "error":
+            return _err(rid, 4004, parsed.get("message", "invalid /loop command"))
 
     if name in {"snapshot", "snap"}:
         subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""

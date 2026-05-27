@@ -3031,6 +3031,28 @@ class GatewayRunner:
         return "interrupt"
 
     @staticmethod
+    def _agent_has_active_subagents(running_agent: Any) -> bool:
+        """Return True if *running_agent* currently owns at least one child.
+
+        The gateway uses this to demote ``busy_input_mode='interrupt'`` to
+        queue semantics while ``delegate_task`` is in flight, preventing
+        the parent's ``interrupt()`` from cascading through
+        ``AIAgent._active_children`` and aborting every subagent (#30170).
+
+        Defence layers:
+        * ``None`` / ``_AGENT_PENDING_SENTINEL`` → False (not a real agent).
+        * Missing ``_active_children`` attribute → False (test stubs).
+        * MagicMock auto-attribute is a truthy ``MagicMock``, not a
+          collection — the ``isinstance`` guard prevents false positives.
+        """
+        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+            return False
+        children = getattr(running_agent, "_active_children", None)
+        if not isinstance(children, (list, tuple, set)):
+            return False
+        return len(children) > 0
+
+    @staticmethod
     def _load_busy_text_mode() -> str:
         """Load normal busy TEXT follow-up behavior from config/env."""
         mode = os.getenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "").strip().lower()
@@ -3235,6 +3257,25 @@ class GatewayRunner:
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
 
+        # Subagent protection (#30170): if the running agent currently owns
+        # active subagents (delegate_task in flight), demote interrupt to
+        # queue semantics.  Interrupting the parent cascades through
+        # AIAgent._active_children and kills every in-flight subagent.
+        subagent_demoted = False
+        if (
+            effective_mode == "interrupt"
+            and running_agent is not None
+            and self._agent_has_active_subagents(running_agent)
+        ):
+            effective_mode = "queue"
+            is_queue_mode = True
+            subagent_demoted = True
+            logger.info(
+                "Subagent protection: demoting interrupt→queue for session %s "
+                "(agent has active subagents)",
+                session_key,
+            )
+
         # If not in queue/steer mode, interrupt the running agent immediately.
         # This aborts in-flight tool calls and causes the agent loop to exit
         # at the next check point.
@@ -3287,6 +3328,12 @@ class GatewayRunner:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
+            )
+        elif subagent_demoted:
+            message = (
+                f"⏳ Subagent working — queued for the next turn{status_detail}. "
+                f"I'll respond once the current task finishes. "
+                f"Send `/stop` to cancel."
             )
         elif is_queue_mode:
             message = (

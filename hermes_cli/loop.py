@@ -475,20 +475,58 @@ class LoopManager:
             return "No active loops. Set one with /loop [interval] <prompt>."
         lines = []
         now = time.time()
-        running = "running" if self.is_running() else "stopped"
         for uid, s in sorted(self._states.items()):
             turns = f"{s.turns_completed}/{self.default_max_turns} turns"
             if s.status == "active":
                 remaining = int((s.last_fired_at + s.interval_seconds) - now) if s.last_fired_at > 0 else 0
                 countdown = _format_countdown(remaining)
                 interval_str = format_interval(s.interval_seconds)
-                lines.append(f"⊙ #{uid} ({running}, every {interval_str}, {countdown}, {turns}): {s.prompt}")
+                lines.append(f"⊙ #{uid} (active, every {interval_str}, {countdown}, {turns}): {s.prompt}")
             elif s.status == "paused":
                 interval_str = format_interval(s.interval_seconds)
                 lines.append(f"⏸ #{uid} (paused, every {interval_str}, {turns}): {s.prompt}")
         return "\n".join(lines)
 
     # --- mutation -----------------------------------------------------
+
+    def set(self, prompt: str, *,
+            interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
+            pending_input: Any = None,
+            is_idle: Optional[Callable[[], bool]] = None) -> LoopState:
+        """Create a new loop with an auto-generated UID.
+
+        If *pending_input* and *is_idle* are given, a background
+        :class:`LoopScheduler` is started automatically.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("loop prompt is empty")
+        effective_interval = max(int(interval_seconds), MIN_INTERVAL_SECONDS)
+        state = LoopState(
+            id=_gen_uid(),
+            prompt=prompt,
+            interval_seconds=effective_interval,
+            status="active",
+            last_fired_at=0.0,
+            created_at=time.time(),
+            turns_completed=0,
+        )
+        self._states[state.id] = state
+        _save_loop(self.session_id, state)
+
+        # Start scheduler when callbacks are provided
+        if pending_input is not None and is_idle is not None:
+            self._stop_scheduler()
+            self._scheduler = LoopScheduler(
+                self.session_id, state,
+                pending_input=pending_input,
+                is_idle=is_idle,
+            )
+            self._scheduler.start()
+        elif self._dispatch is not None:
+            self._start_scheduler()
+
+        return state
 
     def add(self, prompt: str, *,
             interval_seconds: int = DEFAULT_INTERVAL_SECONDS) -> LoopState:
@@ -510,7 +548,7 @@ class LoopManager:
         _save_loop(self.session_id, state)
         return state
 
-    def pause(self, uid: Optional[str] = None) -> List[LoopState]:
+    def pause(self, uid: Optional[str] = None, *, reason: Optional[str] = None) -> List[LoopState]:
         """Pause one loop by UID, or all if uid is None."""
         if uid is not None:
             s = self._states.get(uid)
@@ -522,6 +560,7 @@ class LoopManager:
                 return []
             s.status = "paused"
             _save_loop(self.session_id, s)
+            self._stop_scheduler()
             return [s]
 
         paused = []
@@ -530,9 +569,13 @@ class LoopManager:
                 s.status = "paused"
                 _save_loop(self.session_id, s)
                 paused.append(s)
+        if paused:
+            self._stop_scheduler()
         return paused
 
-    def resume(self, uid: Optional[str] = None) -> List[LoopState]:
+    def resume(self, uid: Optional[str] = None, *,
+               pending_input: Any = None,
+               is_idle: Optional[Callable[[], bool]] = None) -> List[LoopState]:
         """Resume one loop by UID, or all if uid is None."""
         if uid is not None:
             s = self._states.get(uid)
@@ -545,6 +588,7 @@ class LoopManager:
             s.status = "active"
             s.last_fired_at = 0.0  # fire immediately on next tick
             _save_loop(self.session_id, s)
+            self._restart_scheduler(pending_input, is_idle)
             return [s]
 
         resumed = []
@@ -554,6 +598,8 @@ class LoopManager:
                 s.last_fired_at = 0.0
                 _save_loop(self.session_id, s)
                 resumed.append(s)
+        if resumed:
+            self._restart_scheduler(pending_input, is_idle)
         return resumed
 
     def clear(self, uid: Optional[str] = None) -> int:
@@ -602,6 +648,19 @@ class LoopManager:
         )
         self._scheduler.start()
 
+    def _restart_scheduler(self, pending_input=None, is_idle=None) -> None:
+        """Restart the scheduler — with *pending_input*/*is_idle* if given, else with dispatch."""
+        if pending_input is not None and is_idle is not None:
+            self._stop_scheduler()
+            self._scheduler = LoopScheduler(
+                self.session_id,
+                pending_input=pending_input,
+                is_idle=is_idle,
+            )
+            self._scheduler.start()
+        elif self._dispatch is not None:
+            self._start_scheduler()
+
     def _stop_scheduler(self) -> None:
         if self._scheduler is not None:
             try:
@@ -619,9 +678,14 @@ class LoopManager:
 class LoopScheduler:
     """Background daemon thread that ticks every second.
 
-    Receives a ``dispatch`` callable — a function that takes a prompt
-    string and returns ``True`` if the prompt was submitted, ``False``
-    if the session is busy (retry next tick).
+    Receives either:
+
+    * **pending_input** + **is_idle** — the queue-based mode used by tests
+      and the CLI.  The scheduler puts the raw prompt string into the
+      queue when the agent is idle and the interval has elapsed.
+    * **dispatch** — the callable mode used by the gateway.  The callable
+      returns ``True`` if the prompt was submitted, ``False`` if the
+      session is busy (retry next tick).
 
     Reloads all loops from SessionDB each tick and dispatches any
     active loop whose interval has elapsed.
@@ -629,9 +693,16 @@ class LoopScheduler:
 
     TICK_INTERVAL = 1.0
 
-    def __init__(self, session_id: str, *,
-                 dispatch: Callable[[str], bool]):
+    def __init__(self, session_id: str, state: Optional[LoopState] = None, *,
+                 pending_input: Any = None,
+                 is_idle: Optional[Callable[[], bool]] = None,
+                 on_message: Optional[Callable[[str], None]] = None,
+                 dispatch: Optional[Callable[[str], bool]] = None):
         self._session_id = session_id
+        self._state = state
+        self._pending_input = pending_input
+        self._is_idle = is_idle
+        self._on_message = on_message  # accepted for API compat; not called
         self._dispatch = dispatch
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -666,6 +737,10 @@ class LoopScheduler:
                 logger.debug("LoopScheduler tick error: %s", exc)
 
     def _tick(self) -> None:
+        # Queue-based mode: check idle first
+        if self._is_idle is not None and not self._is_idle():
+            return
+
         states = load_all_loops(self._session_id)
         if not states:
             return
@@ -677,10 +752,17 @@ class LoopScheduler:
             if (state.last_fired_at > 0
                     and (now - state.last_fired_at) < state.interval_seconds):
                 continue
-            if self._dispatch(state.prompt):
+
+            if self._pending_input is not None:
+                self._pending_input.put(state.prompt)
                 state.last_fired_at = now
                 state.turns_completed += 1
                 _save_loop(self._session_id, state)
+            elif self._dispatch is not None:
+                if self._dispatch(state.prompt):
+                    state.last_fired_at = now
+                    state.turns_completed += 1
+                    _save_loop(self._session_id, state)
 
 
 __all__ = [

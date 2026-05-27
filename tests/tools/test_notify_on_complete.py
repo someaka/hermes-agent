@@ -16,12 +16,9 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from gateway.session_context import (
-    _UNSET,
-    _VAR_MAP,
-    clear_session_vars,
-    get_session_env,
-    set_session_vars,
+from tools.process_registry import (
+    ProcessRegistry,
+    ProcessSession,
 )
 from tools.process_registry import (
     ProcessRegistry,

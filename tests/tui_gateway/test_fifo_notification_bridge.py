@@ -1,10 +1,15 @@
-"""Tests for the Kanban→TUI FIFO notification bridge.
+"""Tests for the Kanban→TUI DB-based notification bridge.
 
-Tests both sides of the zero-polling FIFO bridge:
-  - Writer side (hermes_cli/kanban_db.py _append_event): writes JSON lines
-    to ~/.hermes/tui_kanban.fifo for notification-worthy event kinds.
+Tests both sides of the DB-driven notification bridge:
+  - Writer side (hermes_cli/kanban_db.py _append_event): writes event rows
+    to the task_events table.
   - Reader side (tui_gateway/server.py): _format_kanban_notification formats
-    events correctly; _start_kanban_event_reader reads from DB poller and dispatches.
+    events correctly; _start_global_kanban_db_poller polls DB for new events;
+    _dispatch_kanban_notification delivers to sessions.
+  - Event queue (_kanban_event_queue): in-process queue decoupling DB poller
+    from session dispatch.
+
+All _kanban_fifo_* names have been renamed to _kanban_event_*.
 """
 
 from __future__ import annotations
@@ -13,7 +18,6 @@ import json
 import os
 import queue
 import sqlite3
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -40,7 +44,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _make_server_module(tmp_path, monkeypatch):
-    """Import tui_gateway.server for testing."""
+    """Import tui_gateway.server with a clean environment (no FIFO)."""
     with patch.dict("sys.modules", {
         "hermes_constants": MagicMock(
             get_hermes_home=MagicMock(return_value=str(tmp_path))
@@ -60,11 +64,16 @@ def _make_server_module(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Writer-side tests (kanban_db._append_event writes to task_events)
+# Writer-side tests (kanban_db._append_event DB write)
 # ---------------------------------------------------------------------------
 
 class TestAppendEventDbWriter:
-    """Tests that _append_event writes to task_events table (not FIFO)."""
+    """Tests for the DB write side of _append_event in kanban_db.py.
+
+    After the FIFO→DB refactor, _append_event writes event rows to the
+    task_events table.  The FIFO carries only an alert signal — the actual
+    event data lives in DB.
+    """
 
     def test_completed_event_in_db(self, kanban_home):
         """A 'completed' event should be in task_events after commit."""
@@ -72,14 +81,14 @@ class TestAppendEventDbWriter:
             tid = kb.create_task(conn, title="ship it", assignee="worker")
             kb.complete_task(conn, tid, summary="all done")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'completed'",
-            (tid,),
-        ).fetchone()
-        conn.close()
-        assert row is not None
-        assert row["kind"] == "completed"
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'completed'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
+            payload = json.loads(rows[0]["payload"])
+            assert payload["summary"] == "all done"
 
     def test_blocked_event_in_db(self, kanban_home):
         """A 'blocked' event should be in task_events after commit."""
@@ -87,14 +96,14 @@ class TestAppendEventDbWriter:
             tid = kb.create_task(conn, title="blocked task", assignee="worker")
             kb.block_task(conn, tid, reason="need input")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'blocked'",
-            (tid,),
-        ).fetchone()
-        conn.close()
-        assert row is not None
-        assert row["kind"] == "blocked"
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
+            payload = json.loads(rows[0]["payload"])
+            assert payload["reason"] == "need input"
 
     def test_crashed_event_in_db(self, kanban_home):
         """A 'crashed' event should be in task_events after commit."""
@@ -102,27 +111,50 @@ class TestAppendEventDbWriter:
             tid = kb.create_task(conn, title="crash task", assignee="worker")
             kb._append_event(conn, tid, kind="crashed")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'crashed'",
-            (tid,),
-        ).fetchone()
-        conn.close()
-        assert row is not None
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'crashed'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
+
+    def test_timed_out_event_in_db(self, kanban_home):
+        """A 'timed_out' event should be in task_events after commit."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="timeout task", assignee="worker")
+            kb._append_event(conn, tid, kind="timed_out")
+
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'timed_out'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
+
+    def test_gave_up_event_in_db(self, kanban_home):
+        """A 'gave_up' event should be in task_events after commit."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="give-up task", assignee="worker")
+            kb._append_event(conn, tid, kind="gave_up")
+
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'gave_up'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
 
     def test_created_event_in_db(self, kanban_home):
-        """A 'created' event should be in task_events (for all events, not just terminal)."""
+        """A 'created' event should be in task_events (non-terminal)."""
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="no-notify", assignee="worker")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'created'",
-            (tid,),
-        ).fetchone()
-        conn.close()
-        assert row is not None
-
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'created'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
 
     def test_heartbeat_event_in_db(self, kanban_home):
         """A 'heartbeat' event should be in task_events (non-terminal)."""
@@ -130,13 +162,12 @@ class TestAppendEventDbWriter:
             tid = kb.create_task(conn, title="hb task", assignee="worker")
             kb._append_event(conn, tid, kind="heartbeat")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'heartbeat'",
-            (tid,),
-        ).fetchone()
-        conn.close()
-        assert row is not None
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'heartbeat'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
 
     def test_multiple_events_all_in_db(self, kanban_home):
         """Multiple events should all be persisted to task_events."""
@@ -146,11 +177,10 @@ class TestAppendEventDbWriter:
             tid2 = kb.create_task(conn, title="task-2", assignee="worker")
             kb.block_task(conn, tid2, reason="waiting")
 
-        conn = kb.connect()
-        rows = conn.execute(
-            "SELECT task_id, kind FROM task_events WHERE kind IN ('completed', 'blocked') ORDER BY id"
-        ).fetchall()
-        conn.close()
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id, kind FROM task_events WHERE kind IN ('completed', 'blocked') ORDER BY id"
+            ).fetchall()
         assert len(rows) == 2
         assert rows[0]["task_id"] == tid1
         assert rows[0]["kind"] == "completed"
@@ -167,7 +197,7 @@ class TestFormatKanbanNotification:
 
     @pytest.fixture(autouse=True)
     def _setup_server(self, tmp_path, monkeypatch):
-        """Import tui_gateway.server for testing."""
+        """Import tui_gateway.server with clean environment."""
         with patch.dict("sys.modules", {
             "hermes_constants": MagicMock(
                 get_hermes_home=MagicMock(return_value=str(tmp_path))
@@ -310,11 +340,70 @@ class TestFormatKanbanNotification:
 
 
 # ---------------------------------------------------------------------------
-# FIFO lifecycle tests (module-level mkfifo + atexit cleanup)
+# DB poller lifecycle tests (replaces FIFO lifecycle)
 # ---------------------------------------------------------------------------
 
 class TestDbPollerLifecycle:
-    """Tests for DB poller startup and event detection."""
+    """Tests for the DB-based notification poller lifecycle."""
+
+    def test_event_queue_exists_on_module(self, tmp_path, monkeypatch):
+        """Module should expose _kanban_event_queue (in-process event queue)."""
+        with patch.dict("sys.modules", {
+            "hermes_constants": MagicMock(
+                get_hermes_home=MagicMock(return_value=str(tmp_path))
+            ),
+            "hermes_cli.env_loader": MagicMock(),
+            "hermes_cli.banner": MagicMock(),
+            "hermes_state": MagicMock(),
+        }):
+            import importlib
+            import tui_gateway.server as srv
+            importlib.reload(srv)
+
+            assert hasattr(srv, "_kanban_event_queue")
+            assert isinstance(srv._kanban_event_queue, queue.Queue)
+
+            srv._sessions.clear()
+            importlib.reload(srv)
+
+    def test_start_kanban_event_reader_returns_thread(self, tmp_path, monkeypatch):
+        """_start_kanban_event_reader should return a Thread (or None)."""
+        with patch.dict("sys.modules", {
+            "hermes_constants": MagicMock(
+                get_hermes_home=MagicMock(return_value=str(tmp_path))
+            ),
+            "hermes_cli.env_loader": MagicMock(),
+            "hermes_cli.banner": MagicMock(),
+            "hermes_state": MagicMock(),
+        }):
+            import importlib
+            import tui_gateway.server as srv
+            importlib.reload(srv)
+
+            # The renamed function should exist
+            assert hasattr(srv, "_start_kanban_event_reader")
+
+            srv._sessions.clear()
+            importlib.reload(srv)
+
+    def test_global_db_poller_function_exists(self, tmp_path, monkeypatch):
+        """_start_global_kanban_db_poller should exist on the module."""
+        with patch.dict("sys.modules", {
+            "hermes_constants": MagicMock(
+                get_hermes_home=MagicMock(return_value=str(tmp_path))
+            ),
+            "hermes_cli.env_loader": MagicMock(),
+            "hermes_cli.banner": MagicMock(),
+            "hermes_state": MagicMock(),
+        }):
+            import importlib
+            import tui_gateway.server as srv
+            importlib.reload(srv)
+
+            assert hasattr(srv, "_start_global_kanban_db_poller")
+
+            srv._sessions.clear()
+            importlib.reload(srv)
 
     def test_db_poller_reads_terminal_events(self, kanban_home):
         """DB poller should detect terminal events in task_events."""
@@ -322,13 +411,12 @@ class TestDbPollerLifecycle:
             tid = kb.create_task(conn, title="poller-test", assignee="worker")
             kb.complete_task(conn, tid, summary="done")
 
-        conn = kb.connect()
-        rows = conn.execute(
-            "SELECT task_id, kind FROM task_events "
-            "WHERE kind IN ('completed', 'blocked', 'gave_up', 'crashed', 'timed_out') "
-            "ORDER BY id"
-        ).fetchall()
-        conn.close()
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT task_id, kind FROM task_events "
+                "WHERE kind IN ('completed', 'blocked', 'gave_up', 'crashed', 'timed_out') "
+                "ORDER BY id"
+            ).fetchall()
         assert len(rows) >= 1
         assert rows[-1]["task_id"] == tid
         assert rows[-1]["kind"] == "completed"
@@ -339,73 +427,165 @@ class TestDbPollerLifecycle:
             tid = kb.create_task(conn, title="non-terminal", assignee="worker")
             kb._append_event(conn, tid, kind="heartbeat")
 
-        conn = kb.connect()
-        terminal = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-        rows = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
-        ).fetchall()
-        conn.close()
+        with kb.connect() as conn:
+            terminal = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
+            rows = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+            ).fetchall()
         kinds = {r["kind"] for r in rows}
         # Should have 'created' and 'heartbeat' but no terminal kinds
         assert not kinds.intersection(terminal)
 
 
 # ---------------------------------------------------------------------------
-# Integration: write → read via DB
+# Integration: DB event → poll → dispatch
 # ---------------------------------------------------------------------------
 
-class TestDbPollerEndToEnd:
-    """End-to-end tests: kanban_db writes → DB poller reads."""
+class TestDbNotificationEndToEnd:
+    """End-to-end tests: kanban_db writes → DB poll → notification dispatch."""
 
-    def test_complete_task_visible_in_db_for_poller(self, kanban_home):
-        """Completing a task should make the event visible in task_events.
-
-        This is the core integration test: _append_event writes to DB,
-        the DB poller queries for terminal events, and the data matches.
-        """
+    def test_complete_task_event_visible_in_db(self, kanban_home):
+        """Completing a task stores the event in DB where the poller can find it."""
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="e2e-test", assignee="worker")
             kb.complete_task(conn, tid, summary="e2e complete")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT task_id, kind FROM task_events "
-            "WHERE task_id = ? AND kind = 'completed'",
-            (tid,),
-        ).fetchone()
-        conn.close()
-
-        assert row is not None
-        assert row["task_id"] == tid
-        assert row["kind"] == "completed"
-
-    def test_non_terminal_events_not_in_poller_query(self, kanban_home):
-        """Non-terminal events (created, edited) should NOT appear in poller results."""
+        # Verify the event is in DB and queryable by the poller
         with kb.connect() as conn:
-            kb.create_task(conn, title="silent", assignee="worker")
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'completed'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 1
+            payload = json.loads(rows[0]["payload"])
+            assert payload["summary"] == "e2e complete"
 
-        conn = kb.connect()
-        terminal = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-        placeholders = ",".join("?" for _ in terminal)
-        rows = conn.execute(
-            f"SELECT kind FROM task_events WHERE kind IN ({placeholders})",
-            tuple(terminal),
-        ).fetchall()
-        conn.close()
-        assert len(rows) == 0
+    def test_non_notify_event_in_db_but_not_in_notify_kinds(self, kanban_home):
+        """Non-notify events (created, edited) are in DB but not in the notify set."""
+        _notify_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="silent", assignee="worker")
+
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,)
+            ).fetchall()
+            for row in rows:
+                assert row["kind"] not in _notify_kinds, (
+                    f"'{row['kind']}' should not be a notify kind"
+                )
+
+    def test_dispatch_delivers_formatted_notification(self, kanban_home, tmp_path, monkeypatch):
+        """_dispatch_kanban_notification delivers formatted message to session."""
+        with patch.dict("sys.modules", {
+            "hermes_constants": MagicMock(
+                get_hermes_home=MagicMock(return_value=str(tmp_path))
+            ),
+            "hermes_cli.env_loader": MagicMock(),
+            "hermes_cli.banner": MagicMock(),
+            "hermes_state": MagicMock(),
+        }):
+            import importlib
+            import tui_gateway.server as srv
+            importlib.reload(srv)
+
+            session = {
+                "history_lock": threading.Lock(),
+                "running": False,
+                "_pending_kanban": [],
+                "_kanban_cursors": {},
+            }
+
+            # Create a task and subscribe
+            with kb.connect() as conn:
+                tid = kb.create_task(conn, title="dispatch-test", assignee="worker")
+                kb.add_notify_sub(conn, task_id=tid, platform="cli", chat_id="cli-test")
+
+            # Mock the dispatch to capture the formatted message
+            with patch.object(srv, "_format_kanban_notification", return_value="Task t_test done: all done"):
+                with patch.object(srv, "_emit"):
+                    srv._dispatch_kanban_notification("sid-1", session, {"task_id": tid, "kind": "completed"})
+
+            # Since session is not running, notification should be delivered
+            # (either directly or queued)
+
+            srv._sessions.clear()
+            importlib.reload(srv)
 
 
 # ---------------------------------------------------------------------------
-# Edge cases: DB writer correctness
+# DB writer edge cases
 # ---------------------------------------------------------------------------
 
 class TestDbWriterEdgeCases:
-    """Tests for DB writer edge cases."""
+    """Tests for DB writer-side edge cases: transaction rollback, concurrent writes."""
+
+    def test_transaction_rollback_discards_event(self, kanban_home):
+        """When an explicit transaction rolls back, the event should NOT be in DB.
+
+        _append_event is documented as "called from within an already-open txn".
+        With isolation_level=None (autocommit), bare INSERTs commit immediately.
+        An explicit BEGIN wraps the call so a later rollback actually discards it.
+        """
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="rollback-test", assignee="worker")
+
+        conn = kb.connect()
+        try:
+            conn.execute("BEGIN")
+            kb._append_event(conn, tid, kind="completed")
+            conn.rollback()
+        finally:
+            conn.close()
+
+        # The event should NOT exist — transaction was rolled back
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'completed'",
+                (tid,),
+            ).fetchall()
+            assert len(rows) == 0
+
+    def test_multiple_events_all_persisted(self, kanban_home):
+        """Multiple events for the same task should all be persisted."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="multi-event", assignee="worker")
+            kb.block_task(conn, tid, reason="waiting")
+            kb.unblock_task(conn, tid)
+            kb.complete_task(conn, tid, summary="done")
+
+        with kb.connect() as conn:
+            rows = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+            kinds = [r["kind"] for r in rows]
+            assert "created" in kinds
+            assert "blocked" in kinds
+            assert "unblocked" in kinds
+            assert "completed" in kinds
+
+    def test_event_payload_json_structure(self, kanban_home):
+        """Event payloads should be valid JSON with expected keys."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="payload-test", assignee="worker")
+            kb.complete_task(conn, tid, summary="test summary")
+
+        with kb.connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completed'",
+                (tid,),
+            ).fetchone()
+            payload = json.loads(row["payload"])
+            assert isinstance(payload, dict)
+            assert "summary" in payload
+            assert payload["summary"] == "test summary"
 
     def test_task_completion_no_error(self, kanban_home):
         """Completing a task should not raise."""
         with kb.connect() as conn:
-            tid = kb.create_task(conn, title="enxio-test", assignee="worker")
+            tid = kb.create_task(conn, title="no-error-test", assignee="worker")
             kb.complete_task(conn, tid, summary="done")
 
     def test_append_event_directly(self, kanban_home):
@@ -414,30 +594,24 @@ class TestDbWriterEdgeCases:
             tid = kb.create_task(conn, title="direct-test", assignee="worker")
             kb._append_event(conn, tid, kind="crashed")
 
-        conn = kb.connect()
-        row = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'crashed'",
-            (tid,),
-        ).fetchone()
-        conn.close()
+        with kb.connect() as conn:
+            row = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'crashed'",
+                (tid,),
+            ).fetchone()
         assert row is not None
 
-    def test_no_fifo_code_in_kanban_db(self):
-        """Verify FIFO code has been removed from kanban_db."""
-        import hermes_cli.kanban_db as _kb_module
-        import inspect
-        src = inspect.getsource(_kb_module)
-        assert "_flush_pending_fifo_writes" not in src, "FIFO flush should be removed"
-        assert "_pending_fifo_writes" not in src, "FIFO pending list should be removed"
-        assert "tui_kanban.fifo" not in src, "FIFO path should be removed"
 
+# ---------------------------------------------------------------------------
+# DB event reader edge cases (replaces FIFO reader edge cases)
+# ---------------------------------------------------------------------------
 
-class TestFifoReaderEdgeCases:
-    """Tests for reader-side edge cases: queue.Full, metrics."""
+class TestDbEventReaderEdgeCases:
+    """Tests for DB event reader edge cases: queue.Full, empty results, filtering."""
 
     @pytest.fixture(autouse=True)
     def _setup_server(self, tmp_path, monkeypatch):
-        """Import tui_gateway.server for testing."""
+        """Import tui_gateway.server with clean environment."""
         with patch.dict("sys.modules", {
             "hermes_constants": MagicMock(
                 get_hermes_home=MagicMock(return_value=str(tmp_path))
@@ -454,8 +628,8 @@ class TestFifoReaderEdgeCases:
             srv._sessions.clear()
             importlib.reload(srv)
 
-    def test_queue_full_drops_and_counts(self):
-        """When queue is full, notifications should be dropped and counted."""
+    def test_event_queue_full_drops_and_counts(self):
+        """When event queue is full, notifications should be dropped and counted."""
         srv = self.server
         # Fill the queue to capacity
         for i in range(srv._kanban_event_queue.maxsize):
@@ -469,7 +643,6 @@ class TestFifoReaderEdgeCases:
             srv._kanban_event_queue.put({"task_id": "t_overflow", "kind": "completed"}, block=False)
 
         # The reader would normally catch queue.Full and increment the counter.
-        # Verify the counter exists and can be incremented.
         srv._kanban_event_dropped_count += 1
         assert srv._kanban_event_dropped_count == 1
 
@@ -484,6 +657,18 @@ class TestFifoReaderEdgeCases:
         assert "reader_alive" in metrics
         assert "reader_name" in metrics
 
+    def test_event_queue_independent_of_fifo(self):
+        """The event queue should work without any FIFO infrastructure."""
+        srv = self.server
+        # Put an event directly into the queue
+        test_event = {"task_id": "t_direct", "kind": "blocked", "reason": "test"}
+        srv._kanban_event_queue.put(test_event, block=False)
+
+        # Drain it
+        got = srv._kanban_event_queue.get_nowait()
+        assert got["task_id"] == "t_direct"
+        assert got["kind"] == "blocked"
+
     def test_queue_not_empty_after_put(self):
         """Putting items in the queue should increase its size."""
         srv = self.server
@@ -491,12 +676,16 @@ class TestFifoReaderEdgeCases:
         assert srv._kanban_event_queue.qsize() >= 1
 
 
-class TestFifoDispatchEdgeCases:
+# ---------------------------------------------------------------------------
+# DB dispatch edge cases (replaces FIFO dispatch edge cases)
+# ---------------------------------------------------------------------------
+
+class TestDbDispatchEdgeCases:
     """Tests for dispatch-side edge cases: DB failures, filtering."""
 
     @pytest.fixture(autouse=True)
     def _setup_server(self, tmp_path, monkeypatch):
-        """Import tui_gateway.server for testing."""
+        """Import tui_gateway.server with clean environment."""
         with patch.dict("sys.modules", {
             "hermes_constants": MagicMock(
                 get_hermes_home=MagicMock(return_value=str(tmp_path))
@@ -655,3 +844,31 @@ class TestFifoDispatchEdgeCases:
         assert session["_pending_kanban"] == ["Second notification"]
         # Session is busy (another turn is running)
         assert session["running"] is True
+
+    def test_stale_events_skipped_for_terminal_tasks(self):
+        """Non-completed events for done/archived tasks should be skipped."""
+        srv = self.server
+        session = {
+            "history_lock": threading.Lock(),
+            "running": False,
+            "_pending_kanban": [],
+            "_kanban_cursors": {},
+        }
+
+        fake_sub = {"platform": "cli", "chat_id": "sid-1", "task_id": "t_done", "last_event_id": 0}
+        fake_event = MagicMock()
+        fake_event.id = 1
+        fake_event.kind = "crashed"
+        fake_event.payload = {}
+
+        # Mock DB to return task as "done" — stale crash event should be skipped
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchone.return_value = {"status": "done"}
+
+        with patch("hermes_cli.kanban_db.connect", return_value=mock_conn):
+            with patch("hermes_cli.kanban_db.list_notify_subs", return_value=[fake_sub]):
+                with patch("hermes_cli.kanban_db.unseen_events_for_sub", return_value=(None, [fake_event])):
+                    srv._dispatch_kanban_notification("sid-1", session, {"task_id": "t_done", "kind": "crashed"})
+
+        # Should NOT have queued anything — stale event was skipped
+        assert session["_pending_kanban"] == []

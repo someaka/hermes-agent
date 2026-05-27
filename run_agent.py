@@ -644,6 +644,8 @@ class AIAgent:
                         # Thread gateway user identity for per-user memory scoping
                         if self._user_id:
                             _init_kwargs["user_id"] = self._user_id
+                        if self._user_id_alt:
+                            _init_kwargs["user_id_alt"] = self._user_id_alt
                         if self._user_name:
                             _init_kwargs["user_name"] = self._user_name
                         if self._chat_id:

@@ -1377,6 +1377,15 @@ class SessionStore:
             "target_text": target_text,
         }
 
+    def close(self) -> None:
+        """Close the underlying SessionDB connection."""
+        if self._db:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None
+
 
 def build_session_context(
     source: SessionSource,

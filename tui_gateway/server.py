@@ -156,16 +156,16 @@ _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
-# ── Kanban→TUI notification FIFO (event-driven, zero polling) ─────────
+# ── Kanban→TUI notification bridge (DB poller, event-driven) ─────────
 # Global queue decouples DB poller from session dispatch.
 # The poller thread is eager (starts at import) and immortal.
-_kanban_fifo_queue: queue.Queue = queue.Queue(maxsize=10000)
+_kanban_event_queue: queue.Queue = queue.Queue(maxsize=10000)
 _kanban_global_poller_thread: threading.Thread | None = None
 
 # Module-level metrics counters for operational visibility.
-_kanban_fifo_dropped_count: int = 0
-_kanban_fifo_received_count: int = 0
-_kanban_fifo_dispatch_failures: int = 0
+_kanban_event_dropped_count: int = 0
+_kanban_event_received_count: int = 0
+_kanban_event_dispatch_failures: int = 0
 _KANBAN_DISPATCH_MAX_RETRIES: int = 3
 _KANBAN_DISPATCH_RETRY_BACKOFF: float = 2.0  # seconds, multiplied by retry count
 
@@ -179,7 +179,7 @@ def _start_global_kanban_db_poller() -> threading.Thread:
     """Start the global kanban DB poller thread (idempotent, eager).
 
     Polls ``task_events`` for new terminal events and pushes them into
-    ``_kanban_fifo_queue``.  Each session's notification poller drains
+    ``_kanban_event_queue``.  Each session's notification poller drains
     the queue for matching subscriptions.
 
     Replaces the old FIFO-based reader which was fragile:
@@ -195,7 +195,7 @@ def _start_global_kanban_db_poller() -> threading.Thread:
         return _kanban_global_poller_thread
 
     def _poller() -> None:
-        global _kanban_fifo_received_count, _kanban_fifo_dropped_count
+        global _kanban_event_received_count, _kanban_event_dropped_count
         _last_event_id: int | None = None  # None = first-run, skip to latest
         _conn = None
 
@@ -240,10 +240,10 @@ def _start_global_kanban_db_poller() -> threading.Thread:
                     _eid, _tid, _kind = _row
                     _data = {"task_id": _tid, "kind": _kind}
                     try:
-                        _kanban_fifo_queue.put(_data, block=False)
-                        _kanban_fifo_received_count += 1
+                        _kanban_event_queue.put(_data, block=False)
+                        _kanban_event_received_count += 1
                     except queue.Full:
-                        _kanban_fifo_dropped_count += 1
+                        _kanban_event_dropped_count += 1
                         logger.debug(
                             "kanban_db_poller: queue full, dropped notification"
                         )
@@ -419,7 +419,7 @@ def _dispatch_kanban_notification(sid: str, session: dict, data: dict) -> None:
                                 )
                                 time.sleep(delay)
                                 try:
-                                    _kanban_fifo_queue.put(data, block=False)
+                                    _kanban_event_queue.put(data, block=False)
                                 except queue.Full:
                                     logger.error(
                                         "kanban retry queue full, "
@@ -458,11 +458,11 @@ def _dispatch_kanban_notification(sid: str, session: dict, data: dict) -> None:
             _conn.close()
     except Exception:
         logger.debug("kanban_notification_dispatch failed", exc_info=True)
-        global _kanban_fifo_dispatch_failures
-        _kanban_fifo_dispatch_failures += 1
+        global _kanban_event_dispatch_failures
+        _kanban_event_dispatch_failures += 1
 
 
-def _start_kanban_fifo_reader(sid: str, session: dict) -> threading.Thread:
+def _start_kanban_event_reader(sid: str, session: dict) -> threading.Thread:
     """Ensure the global kanban DB poller is running.
 
     Per-session readers are replaced by a single global poller
@@ -473,14 +473,14 @@ def _start_kanban_fifo_reader(sid: str, session: dict) -> threading.Thread:
     return _start_global_kanban_db_poller()
 
 
-def get_kanban_fifo_metrics() -> dict:
+def get_kanban_event_metrics() -> dict:
     """Return operational metrics for the kanban notification bridge."""
     return {
-        "queue_depth": _kanban_fifo_queue.qsize(),
-        "queue_maxsize": _kanban_fifo_queue.maxsize,
-        "dropped_count": _kanban_fifo_dropped_count,
-        "received_count": _kanban_fifo_received_count,
-        "dispatch_failures": _kanban_fifo_dispatch_failures,
+        "queue_depth": _kanban_event_queue.qsize(),
+        "queue_maxsize": _kanban_event_queue.maxsize,
+        "dropped_count": _kanban_event_dropped_count,
+        "received_count": _kanban_event_received_count,
+        "dispatch_failures": _kanban_event_dispatch_failures,
         "reader_alive": (
             _kanban_global_poller_thread.is_alive()
             if _kanban_global_poller_thread is not None
@@ -4621,7 +4621,7 @@ def _notification_poller_loop(
             _batch_events: list[dict] = []
             try:
                 while True:
-                    _batch_events.append(_kanban_fifo_queue.get_nowait())
+                    _batch_events.append(_kanban_event_queue.get_nowait())
             except queue.Empty:
                 pass
             if _batch_events:

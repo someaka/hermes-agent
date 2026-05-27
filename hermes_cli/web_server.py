@@ -3489,7 +3489,7 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
 # the chat tab generates on mount; entries auto-evict when the last subscriber
 # drops AND the publisher has disconnected.
 _event_channels: dict[str, set] = {}
-_event_lock = asyncio.Lock()
+_event_lock = threading.Lock()
 
 
 def _resolve_chat_argv(
@@ -3575,7 +3575,7 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
 
 async def _broadcast_event(channel: str, payload: str) -> None:
     """Fan out one publisher frame to every subscriber on `channel`."""
-    async with _event_lock:
+    with _event_lock:
         subs = list(_event_channels.get(channel, ()))
 
     for sub in subs:
@@ -3793,7 +3793,7 @@ async def events_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    async with _event_lock:
+    with _event_lock:
         _event_channels.setdefault(channel, set()).add(ws)
 
     try:
@@ -3805,7 +3805,7 @@ async def events_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        async with _event_lock:
+        with _event_lock:
             subs = _event_channels.get(channel)
 
             if subs is not None:

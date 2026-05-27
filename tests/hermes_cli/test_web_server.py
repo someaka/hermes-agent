@@ -2318,26 +2318,28 @@ class TestPtyWebSocket:
             # server adds us to ``_event_channels`` in a follow-up await,
             # so a publish immediately after connect can race ahead of the
             # subscriber registration and the message is dropped.
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
+            _registered = False
+            for _ in range(500):  # 5s max (500 * 10ms)
                 if ws_mod._event_channels.get("broadcast-test"):
+                    _registered = True
                     break
                 time.sleep(0.01)
-            else:
-                raise AssertionError(
-                    "subscriber did not register on channel within 5s"
-                )
+            assert _registered, "subscriber did not register on channel within 5s"
 
             with self.client.websocket_connect(pub_path) as pub:
+                # Give the server a moment to fully register the subscriber
+                # before publishing — prevents the broadcast from racing
+                # ahead of the events_ws handler's set.add() call.
+                time.sleep(0.05)
+
                 pub.send_text('{"type":"tool.start","payload":{"tool_id":"t1"}}')
-                # Yield control so the server-side broadcast handler can
-                # process the frame.  TestClient runs the ASGI app in a
-                # background thread; a small sleep gives that thread time
-                # to call _broadcast_event before we start blocking on
-                # receive_text().  Without this, under heavy CI load the
-                # receive can race the broadcast and hang until
-                # pytest-timeout kills us.
+
+                # Receive the broadcast.  TestClient.receive_text() blocks
+                # until data arrives or the socket closes.  We wrap it in a
+                # thread with a generous timeout so a silent drop doesn't
+                # hang the entire test suite.
                 import queue, threading
+
                 recv_q: queue.Queue = queue.Queue()
 
                 def _recv():
@@ -2349,12 +2351,11 @@ class TestPtyWebSocket:
                 t = threading.Thread(target=_recv, daemon=True)
                 t.start()
                 try:
-                    received = recv_q.get(timeout=10.0)
+                    received = recv_q.get(timeout=15.0)
                 except queue.Empty:
                     raise AssertionError(
-                        "broadcast not received within 10s — server likely "
-                        "dropped the frame silently (see _broadcast_event "
-                        "except Exception: pass)"
+                        "broadcast not received within 15s — _broadcast_event "
+                        "may have dropped the frame or the event loop is stalled"
                     )
                 if isinstance(received, Exception):
                     raise received

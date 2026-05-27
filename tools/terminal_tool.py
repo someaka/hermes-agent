@@ -2409,11 +2409,15 @@ def terminal_tool(
             return json.dumps(result_dict, ensure_ascii=False)
 
     except Exception as e:
-        import traceback
-        from hermes_cli.sanitize import sanitize_traceback
+        import traceback, re
         tb_str = traceback.format_exc()
         logger.error("terminal_tool exception:\n%s", tb_str)
-        tb_str = sanitize_traceback(tb_str)
+        # Sanitize traceback: strip absolute paths and truncate to avoid
+        # leaking sensitive local variables or long stack traces to LLM context.
+        tb_str = re.sub(r'/(?:[\w.-]+/)+[\w.-]+', '<path>', tb_str)
+        tb_str = re.sub(r'[A-Za-z]:\\(?:[\w.-]+\\)+[\w.-]+', '<path>', tb_str)
+        if len(tb_str) > 2000:
+            tb_str = tb_str[:2000] + "\n... (truncated)"
         return json.dumps({
             "output": "",
             "exit_code": -1,

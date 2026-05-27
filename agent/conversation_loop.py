@@ -1078,9 +1078,9 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         # Only needed for Ollama-served models — cloud APIs don't produce
         # surrogates, so skip the O(n*m) scan for non-Ollama providers.
-        _p = (getattr(agent, "provider", None) or "").lower()
-        _bu = (getattr(agent, "base_url", None) or "").lower()
-        if "ollama" in _p or "ollama" in _bu or ":11434" in _bu:
+        _prov = (getattr(agent, "provider", None) or "").lower()
+        _burl = (getattr(agent, "base_url", None) or "").lower()
+        if "ollama" in _prov or "ollama" in _burl or ":11434" in _burl:
             _sanitize_messages_surrogates(api_messages)
 
         # Calculate approximate request size for logging

@@ -8543,7 +8543,9 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
 # the chat tab generates on mount; entries auto-evict when the last subscriber
 # drops AND the publisher has disconnected.
-# (State is initialised in _lifespan on app startup — see above.)
+# (State is module-level — _event_channels and _event_lock below.)
+_event_channels: dict[str, set] = {}
+_event_lock = threading.Lock()
 
 
 def _resolve_chat_argv(
@@ -8674,9 +8676,8 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
 
 async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
     """Fan out one publisher frame to every subscriber on `channel`."""
-    event_channels, event_lock = _get_event_state(app)
-    async with event_lock:
-        subs = list(event_channels.get(channel, ()))
+    with _event_lock:
+        subs = list(_event_channels.get(channel, ()))
 
     for sub in subs:
         try:
@@ -8929,9 +8930,8 @@ async def events_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    event_channels, event_lock = _get_event_state(ws.app)
-    async with event_lock:
-        event_channels.setdefault(channel, set()).add(ws)
+    with _event_lock:
+        _event_channels.setdefault(channel, set()).add(ws)
 
     try:
         while True:
@@ -8942,8 +8942,8 @@ async def events_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        async with event_lock:
-            subs = event_channels.get(channel)
+        with _event_lock:
+            subs = _event_channels.get(channel)
 
             if subs is not None:
                 subs.discard(ws)

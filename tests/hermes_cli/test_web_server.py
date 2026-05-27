@@ -4402,28 +4402,25 @@ class TestPtyWebSocket:
             async def send_text(self, payload: str) -> None:
                 self.sent.append(payload)
 
-        app = ws_mod.app
-
         async def _run():
             sub_a1 = _FakeSub()
             sub_a2 = _FakeSub()
             sub_other = _FakeSub()
             frame = '{"type":"tool.start","payload":{"tool_id":"t1"}}'
 
-            event_channels, event_lock = ws_mod._get_event_state(app)
             # Register two subscribers on the target channel and one on a
             # different channel, exactly as the /api/events handler does.
-            async with event_lock:
-                event_channels.setdefault("broadcast-test", set()).update(
+            with ws_mod._event_lock:
+                ws_mod._event_channels.setdefault("broadcast-test", set()).update(
                     {sub_a1, sub_a2}
                 )
-                event_channels.setdefault("other-channel", set()).add(sub_other)
+                ws_mod._event_channels.setdefault("other-channel", set()).add(sub_other)
             try:
-                await ws_mod._broadcast_event(app, "broadcast-test", frame)
+                await ws_mod._broadcast_event(None, "broadcast-test", frame)
             finally:
-                async with event_lock:
-                    event_channels.pop("broadcast-test", None)
-                    event_channels.pop("other-channel", None)
+                with ws_mod._event_lock:
+                    ws_mod._event_channels.pop("broadcast-test", None)
+                    ws_mod._event_channels.pop("other-channel", None)
 
             return sub_a1, sub_a2, sub_other, frame
 

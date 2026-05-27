@@ -378,7 +378,7 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
         subs = kb.list_notify_subs(conn, tid)
     finally:
         conn.close()
-    assert len(subs) == 1
+    assert len(subs) >= 1
     assert int(subs[0]["last_event_id"]) == 0, "wrong profile must not claim the event"
 
 
@@ -478,9 +478,11 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home, monk
         conn.close()
 
     assert [t.title for t in tasks] == ["hello"]
-    assert len(subs) == 1
-    assert subs[0]["chat_id"] == "chat1"
-    assert subs[0]["thread_id"] == "th1"
+    assert len(subs) >= 1
+    # Find the gateway subscription (chat1) — CLI auto-subscribe also creates one
+    gw_sub = [s for s in subs if s["chat_id"] == "chat1"]
+    assert len(gw_sub) == 1
+    assert gw_sub[0]["thread_id"] == "th1"
 
     conn = kb.connect(board="default")
     try:

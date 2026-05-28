@@ -1122,11 +1122,17 @@ def _cross_process_init_lock(path: Path):
             handle.seek(0)
             locking = getattr(msvcrt, "locking")
             lock_mode = getattr(msvcrt, "LK_LOCK")
-            locking(handle.fileno(), lock_mode, 1)
+            try:
+                locking(handle.fileno(), lock_mode, 1)
+            except (OSError, TypeError):
+                pass
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except (OSError, TypeError):
+                pass
         yield
     finally:
         try:
@@ -1136,11 +1142,17 @@ def _cross_process_init_lock(path: Path):
                 handle.seek(0)
                 locking = getattr(msvcrt, "locking")
                 unlock_mode = getattr(msvcrt, "LK_UNLCK")
-                locking(handle.fileno(), unlock_mode, 1)
+                try:
+                    locking(handle.fileno(), unlock_mode, 1)
+                except (OSError, TypeError):
+                    pass
             else:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except (OSError, TypeError):
+                    pass
         finally:
             handle.close()
 

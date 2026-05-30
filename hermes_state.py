@@ -301,6 +301,26 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS loops (
+    session_id       TEXT NOT NULL,
+    uid              TEXT NOT NULL,
+    prompt           TEXT NOT NULL,
+    interval_seconds INTEGER NOT NULL DEFAULT 300,
+    last_fired_at    REAL DEFAULT 0.0,
+    turns_completed  INTEGER DEFAULT 0,
+    max_turns        INTEGER DEFAULT 20,
+    status           TEXT NOT NULL DEFAULT 'active',
+    created_at       REAL DEFAULT 0.0,
+    source_json      TEXT,
+    platform         TEXT DEFAULT 'cli',
+    reason           TEXT,
+    PRIMARY KEY (session_id, uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_loops_session ON loops(session_id);
+CREATE INDEX IF NOT EXISTS idx_loops_due ON loops(status, last_fired_at, interval_seconds)
+    WHERE status = 'active';
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -614,6 +634,15 @@ class SessionDB:
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
+
+    def _execute_read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Execute a read-only query with the connection lock.
+
+        *fn* receives the connection and should perform SELECT statements only.
+        No commit or rollback — reads don't modify state.
+        """
+        with self._lock:
+            return fn(self._conn)
 
     def _try_wal_checkpoint(self) -> None:
         """Best-effort TRUNCATE WAL checkpoint.  Never raises.
@@ -3641,6 +3670,8 @@ class SessionDB:
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM loops WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM state_meta WHERE key LIKE ?", (f"loop:{sid}:%",))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
@@ -3671,6 +3702,12 @@ class SessionDB:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+        self._execute_write(_do)
+
+    def delete_meta(self, key: str) -> None:
+        """Delete a key from the state_meta key/value store."""
+        def _do(conn):
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (key,))
         self._execute_write(_do)
 
     def apply_telegram_topic_migration(self) -> None:

@@ -191,7 +191,7 @@ def _save_ids(session_id: str, ids: List[str]) -> None:
         if ids:
             db.set_meta(_ids_registry_key(session_id), json.dumps(ids))
         else:
-            db.set_meta(_ids_registry_key(session_id), "")
+            db.delete_meta(_ids_registry_key(session_id))
     except Exception as exc:
         logger.debug("LoopManager: save_ids failed: %s", exc)
 
@@ -278,7 +278,7 @@ def _del_loop_meta(session_id: str, uid: str) -> None:
     if db is None:
         return
     try:
-        db.set_meta(_loop_key(session_id, uid), "")
+        db.delete_meta(_loop_key(session_id, uid))
     except Exception as exc:
         logger.debug("LoopManager: delete_meta failed: %s", exc)
     _remove_id_from_registry(session_id, uid)
@@ -293,8 +293,8 @@ def _del_all_loop_meta(session_id: str) -> None:
         return
     try:
         for uid in _load_ids(session_id):
-            db.set_meta(_loop_key(session_id, uid), "")
-        db.set_meta(_ids_registry_key(session_id), "")
+            db.delete_meta(_loop_key(session_id, uid))
+        db.delete_meta(_ids_registry_key(session_id))
     except Exception as exc:
         logger.debug("LoopManager: delete_all_meta failed: %s", exc)
 

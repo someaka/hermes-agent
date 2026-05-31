@@ -137,8 +137,9 @@ class TestGatewayWatcherPath:
     def test_gateway_has_pending_watchers_drain(self):
         """Source guard: gateway/run.py must drain pending_watchers after agent runs."""
         src = Path("gateway/run.py").read_text()
-        assert "while process_registry.pending_watchers:" in src
-        assert "process_registry.pending_watchers.pop(0)" in src
+        # Atomic batch detach: grab the list, replace with empty, iterate detached copy.
+        # This prevents watchers appended during iteration from being silently dropped.
+        assert "process_registry.pending_watchers = []" in src
         assert "asyncio.create_task(self._run_process_watcher(watcher))" in src
 
     def test_gateway_watcher_checks_is_completion_consumed(self):

@@ -320,6 +320,7 @@ _LONG_HANDLERS = frozenset(
         "cli.exec",
         "session.branch",
         "session.compress",
+        "session.interrupt",
         "session.resume",
         "shell.exec",
         "skills.manage",
@@ -4013,6 +4014,15 @@ def _(rid, params: dict) -> dict:
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
+    # Wait for the agent loop to actually finish before returning.
+    # Without this, prompt.submit fires immediately after interrupt and
+    # hits "session busy" because session["running"] is still True — the
+    # agent hasn't had time to check _interrupt_requested and exit.
+    for _ in range(100):  # up to 5s
+        with session["history_lock"]:
+            if not session.get("running"):
+                break
+        time.sleep(0.05)
     return _ok(rid, {"status": "interrupted"})
 
 

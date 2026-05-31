@@ -1,19 +1,12 @@
-"""File-based platform adapter for TUI/CLI notification delivery.
+"""HTTP-based platform adapter for TUI/CLI notification delivery.
 
 This adapter registers with the gateway's adapter system so that
 _kanban_notifier_watcher (and any other gateway-side event source) can
 deliver events to connected TUI/CLI sessions via ``adapter.send()``.
 
-Unlike Telegram/Discord adapters that push to external APIs, this adapter
-writes events to a JSON-lines file that the TUI server watches and
-dispatches to active sessions.  This bridges the gateway↔TUI process
-boundary without OS-specific IPC (no Unix sockets, no FIFOs, no named
-pipes) — just cross-platform file I/O.
-
-File: ``~/.hermes/notifications/tui_events.jsonl``
-Format: one JSON object per line::
-
-    {"ts": 1717000000, "chat_id": "tui", "content": "...", "metadata": {...}}
+Unlike the previous file-based adapter that polled a JSON-lines file,
+this adapter POSTs events directly to the TUI server's HTTP endpoint.
+Event-driven — no polling, no files, no queues.
 """
 
 from __future__ import annotations
@@ -21,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -30,48 +23,48 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 logger = logging.getLogger(__name__)
 
-# ── Event file path ──────────────────────────────────────────────────
 _HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-_EVENT_DIR = _HERMES_HOME / "notifications"
-_EVENT_FILE = _EVENT_DIR / "tui_events.jsonl"
-
-# Maximum file size before rotation (512 KB).  The TUI truncates what
-# it has consumed, so this only bounds crash-orphaned growth.
-_MAX_FILE_BYTES = 512 * 1024
+_PORT_FILE = _HERMES_HOME / "tui_notify_port"
 
 
-def _ensure_dir() -> None:
-    _EVENT_DIR.mkdir(parents=True, exist_ok=True)
+def _read_tui_port() -> int:
+    """Read the TUI notification HTTP port from the port file."""
+    try:
+        return int(_PORT_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return 0
 
 
-def append_event(chat_id: str, content: str, metadata: dict | None = None) -> None:
-    """Append a notification event to the shared JSON-lines file.
-
-    Called by :meth:`TUIAdapter.send` in the gateway process.
-    The TUI server's watcher thread reads the other end.
-    """
-    _ensure_dir()
-    entry = {
-        "ts": int(time.time()),
+def _post_event(chat_id: str, content: str, metadata: dict | None = None) -> None:
+    """POST a notification event to the TUI server's HTTP endpoint."""
+    port = _read_tui_port()
+    if not port:
+        logger.debug("tui_adapter: TUI notification port not found")
+        return
+    payload = json.dumps({
         "chat_id": chat_id,
         "content": content,
         "metadata": metadata or {},
-    }
-    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+    }, ensure_ascii=False).encode("utf-8")
     try:
-        with open(_EVENT_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError as exc:
-        logger.debug("tui_adapter: failed to write event: %s", exc)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/notify",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception as exc:
+        logger.debug("tui_adapter: POST failed: %s", exc)
 
 
 class TUIAdapter(BasePlatformAdapter):
-    """Platform adapter that delivers messages via a shared file.
+    """Platform adapter that delivers messages via HTTP POST to the TUI.
 
     The gateway's kanban notifier calls ``adapter.send(chat_id, msg)``
-    which appends the event to ``~/.hermes/notifications/tui_events.jsonl``.
-    The TUI server watches this file and dispatches events to active
-    sessions — bridging the gateway↔TUI process boundary.
+    which POSTs the event to the TUI server's local HTTP endpoint.
+    The TUI server dispatches events directly to active sessions.
     """
 
     def __init__(self, config: PlatformConfig, platform: Platform):
@@ -84,16 +77,16 @@ class TUIAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Write the event to the shared notification file."""
+        """POST the event to the TUI server."""
         try:
-            append_event(chat_id, content, metadata)
+            _post_event(chat_id, content, metadata)
             return SendResult(success=True)
         except Exception as exc:
-            logger.warning("tui_adapter: write failed: %s", exc)
+            logger.warning("tui_adapter: POST failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
     async def connect(self) -> bool:
-        """No external connection needed — file I/O only."""
+        """No external connection needed — HTTP POST only."""
         self._running = True
         return True
 
@@ -106,7 +99,7 @@ class TUIAdapter(BasePlatformAdapter):
         return {"chat_id": chat_id, "platform": "tui", "type": "direct"}
 
     async def start(self) -> None:
-        """No external connection needed — file I/O only."""
+        """No external connection needed — HTTP POST only."""
         self._running = True
 
     async def stop(self) -> None:

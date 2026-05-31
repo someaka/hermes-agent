@@ -158,11 +158,9 @@ _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # ── Kanban→TUI notification bridge ──────────────────────────────
 # The gateway's _kanban_notifier_watcher delivers terminal kanban events
-# via the TUI platform adapter, which writes them to a JSON-lines file
-# (~/.hermes/notifications/tui_events.jsonl).  A watcher thread in this
-# process reads the file and dispatches events to active sessions.
-# This bridges the gateway↔TUI process boundary with cross-platform
-# file I/O — no OS-specific IPC, no in-process callbacks.
+# via the TUI platform adapter, which POSTs them to a local HTTP
+# endpoint on the TUI server.  The endpoint dispatches events directly
+# to active sessions — event-driven, no polling, no queues, no files.
 
 
 def _format_kanban_event(ev, task_id: str) -> "str | None":
@@ -4666,155 +4664,99 @@ def _dispatch_kanban_to_session(sid: str, session: dict, task_id: str, kind: str
             session["running"] = False
 
 
-# ── File-based notification watcher ─────────────────────────────────
-# Reads events written by the gateway's TUIAdapter from a JSON-lines
-# file and dispatches them to active sessions.  Started once at module
-# load as a daemon thread — no session needed.
+# ── HTTP notification endpoint ───────────────────────────────────
+# The gateway's TUIAdapter POSTs kanban events to this endpoint.
+# Events are dispatched directly to active sessions — no polling.
 
-_NOTIF_FILE = (
-    Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    / "notifications" / "tui_events.jsonl"
-)
-_notif_warter_started = False
+_NOTIF_HTTP_PORT: int = 0
+_NOTIF_HTTP_STARTED = False
 
 
-def _notification_file_watcher() -> None:
-    """Watch the shared notification file for events from the gateway.
+def _handle_notification_post(body: dict) -> None:
+    """Dispatch a notification event received via HTTP POST."""
+    content = body.get("content", "")
+    metadata = body.get("metadata", {})
+    task_id = metadata.get("task_id", "")
+    kind = metadata.get("kind", "completed")
+    payload = metadata.get("payload", {})
 
-    Runs as a daemon thread.  Reads new lines from the JSON-lines file
-    written by gateway.platforms.tui_adapter.TUIAdapter.send(), formats
-    them, and dispatches to active TUI sessions via _dispatch_kanban_to_session.
+    if not content:
+        return
 
-    After consuming all lines, truncates the file to prevent unbounded
-    growth.  Uses os.replace for atomic truncation.
-    """
-    import json as _json
-
-    last_pos = 0
-    while True:
-        try:
-            time.sleep(2.0)
-            if not _NOTIF_FILE.exists():
-                continue
-
+    if task_id:
+        for _sid, _session in list(_sessions.items()):
             try:
-                with open(_NOTIF_FILE, "r", encoding="utf-8") as f:
-                    f.seek(last_pos)
-                    new_lines = f.readlines()
-                    last_pos = f.tell()
-            except (OSError, ValueError):
-                last_pos = 0
-                continue
-
-            if not new_lines:
-                # No new lines — truncate if file is large to prevent
-                # unbounded growth from crash orphans.
+                _dispatch_kanban_to_session(
+                    _sid, _session, task_id, kind, payload,
+                )
+            except Exception:
+                pass
+    else:
+        for _sid, _session in list(_sessions.items()):
+            try:
+                with _session["history_lock"]:
+                    if _session.get("running"):
+                        _session.setdefault("_pending_kanban", []).append(content)
+                        _emit("status.update", _sid,
+                              {"kind": "process", "text": content})
+                        continue
+                    _session["running"] = True
+                _rid = f"__notif__{int(time.time() * 1000)}"
                 try:
-                    if _NOTIF_FILE.stat().st_size > 64 * 1024:
-                        _tmp = _NOTIF_FILE.with_suffix(".tmp")
-                        _tmp.write_text("", encoding="utf-8")
-                        os.replace(str(_tmp), str(_NOTIF_FILE))
-                        last_pos = 0
-                except OSError:
-                    pass
-                continue
-
-            # Compute the byte offset BEFORE processing so we can
-            # truncate only the data we already consumed — prevents
-            # re-reading the same lines on the next cycle.
-            consumed_end = last_pos + sum(len(l.encode("utf-8")) for l in new_lines)
-
-            for line in new_lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = _json.loads(line)
-                except (_json.JSONDecodeError, ValueError):
-                    continue
-
-                content = evt.get("content", "")
-                metadata = evt.get("metadata", {})
-                task_id = metadata.get("task_id", "")
-                kind = metadata.get("kind", "completed")
-                payload = metadata.get("payload", {})
-
-                if not content:
-                    continue
-
-                # If we have structured metadata, use _dispatch_kanban_to_session.
-                # Otherwise, treat as a raw notification message.
-                if task_id:
-                    for _sid, _session in list(_sessions.items()):
-                        try:
-                            _dispatch_kanban_to_session(
-                                _sid, _session, task_id, kind, payload,
-                            )
-                        except Exception:
-                            pass
-                else:
-                    # Raw message — dispatch as a notification turn
-                    for _sid, _session in list(_sessions.items()):
-                        try:
-                            with _session["history_lock"]:
-                                if _session.get("running"):
-                                    _session.setdefault("_pending_kanban", []).append(content)
-                                    _emit("status.update", _sid,
-                                          {"kind": "process", "text": content})
-                                    continue
-                                _session["running"] = True
-                            _rid = f"__notif__{int(time.time() * 1000)}"
-                            try:
-                                _emit("message.start", _sid)
-                                _run_prompt_submit(_rid, _sid, _session, content)
-                            except Exception:
-                                with _session["history_lock"]:
-                                    _session["running"] = False
-                        except Exception:
-                            pass
-
-            # After consuming, truncate the file to prevent growth.
-            # Use consumed_end (not last_pos) so we only remove data
-            # we already processed.  Don't reset last_pos — the file
-            # is now smaller, so future reads start at 0 anyway.
-            try:
-                file_size = _NOTIF_FILE.stat().st_size
-                if file_size > 0:
-                    _tmp = _NOTIF_FILE.with_suffix(".tmp")
-                    _tmp.write_text("", encoding="utf-8")
-                    os.replace(str(_tmp), str(_NOTIF_FILE))
-                    last_pos = 0
-            except OSError:
-                # If truncation fails, advance last_pos so we don't
-                # re-read the same data next cycle.
-                last_pos = consumed_end
-
-        except Exception:
-            # Never crash the watcher — log and continue.
-            try:
-                import traceback
-                traceback.print_exc()
+                    _emit("message.start", _sid)
+                    _run_prompt_submit(_rid, _sid, _session, content)
+                except Exception:
+                    with _session["history_lock"]:
+                        _session["running"] = False
             except Exception:
                 pass
 
 
-def _start_notification_file_watcher() -> None:
-    """Start the file-based notification watcher (once per process)."""
-    global _notif_warter_started
-    if _notif_warter_started:
+def _start_notification_http() -> None:
+    """Start a minimal HTTP server for gateway→TUI notification delivery."""
+    global _NOTIF_HTTP_PORT, _NOTIF_HTTP_STARTED
+    if _NOTIF_HTTP_STARTED:
         return
-    _notif_warter_started = True
-    t = threading.Thread(
-        target=_notification_file_watcher,
-        name="notif-file-watcher",
-        daemon=True,
-    )
+    _NOTIF_HTTP_STARTED = True
+
+    import socket
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            try:
+                import json as _json
+                data = _json.loads(body)
+                _handle_notification_post(data)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            except Exception as exc:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(str(exc).encode())
+
+        def log_message(self, *args):
+            pass  # suppress stderr logging
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    _NOTIF_HTTP_PORT = server.server_address[1]
+
+    # Write port to file so the gateway's TUIAdapter can find it.
+    _port_file = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "tui_notify_port"
+    try:
+        _port_file.write_text(str(_NOTIF_HTTP_PORT))
+    except OSError:
+        pass
+
+    t = threading.Thread(target=server.serve_forever, name="notif-http", daemon=True)
     t.start()
 
 
-# Auto-start on module import — the watcher is a daemon thread that
-# sleeps most of the time and only wakes when the file has content.
-_start_notification_file_watcher()
+# Auto-start on module import.
+_start_notification_http()
 
 
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
@@ -5229,16 +5171,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     session["running"] = False
 
         # Drain completion notifications that arrived during this turn.
-        # The background poller handles between-turn delivery; this is
-        # the safety net for events that arrived mid-turn.
+        # Events are delivered via process_registry._completion_callback;
+        # if the session is busy, queue for later dispatch.
         try:
             from tools.process_registry import process_registry
 
             for _evt, synth in process_registry.drain_notifications():
                 with session["history_lock"]:
                     if session.get("running"):
-                        process_registry.completion_queue.put(_evt)
-                        break
+                        session.setdefault("_pending_kanban", []).append(synth)
+                        _emit("status.update", sid,
+                              {"kind": "process", "text": synth})
+                        continue
                     session["running"] = True
                 try:
                     _emit("message.start", sid)

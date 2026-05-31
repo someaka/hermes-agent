@@ -142,6 +142,7 @@ class Platform(Enum):
     are cached in ``_value2member_map_`` for identity-stable comparisons.
     """
     LOCAL = "local"
+    CLI = "cli"
     TELEGRAM = "telegram"
     DISCORD = "discord"
     WHATSAPP = "whatsapp"
@@ -163,7 +164,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
-    GOOGLE_CHAT = "google_chat"
+    TUI = "tui"
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -488,9 +489,6 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.DINGTALK: lambda cfg: bool(
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
-    ),
-    Platform.GOOGLE_CHAT: lambda cfg: bool(
-        os.getenv("GOOGLE_CHAT_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
     ),
 }
 

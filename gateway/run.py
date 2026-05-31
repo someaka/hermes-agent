@@ -4745,7 +4745,8 @@ class GatewayRunner:
             )
             await _tui_adapter.start()
             self.adapters[Platform("tui")] = _tui_adapter
-            logger.info("TUI platform adapter registered for kanban delivery")
+            self.adapters[Platform("cli")] = _tui_adapter
+            logger.info("TUI platform adapter registered for kanban delivery (tui + cli)")
         except Exception as _tui_exc:
             logger.debug("TUI adapter registration failed (non-fatal): %s", _tui_exc)
 

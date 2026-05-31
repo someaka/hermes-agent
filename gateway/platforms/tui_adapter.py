@@ -58,6 +58,19 @@ class TUIAdapter(BasePlatformAdapter):
             logger.warning("tui_adapter: delivery callback failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def connect(self) -> bool:
+        """No external connection needed — callback is set externally."""
+        self._running = True
+        return True
+
+    async def disconnect(self) -> None:
+        """No external connection to tear down."""
+        self._running = False
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """Return minimal chat info for the TUI platform."""
+        return {"chat_id": chat_id, "platform": "tui", "type": "direct"}
+
     async def start(self) -> None:
         """No external connection needed — callback is set externally."""
         self._running = True

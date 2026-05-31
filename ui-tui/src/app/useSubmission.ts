@@ -105,7 +105,11 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
         patchUiState({ busy: true, status: 'running…' })
         turnController.bufRef = ''
-        turnController.interrupted = false
+        // NOTE: do NOT reset turnController.interrupted here.
+        // startMessage() (fired by gateway's message.start event) resets it.
+        // If we clear it now, a stale message.complete from the interrupted
+        // turn arrives with wasInterrupted=false and re-appends its partial
+        // response — doubling.  See #doubling-race.
 
         gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText }).catch((e: Error) => {
           if (isSessionBusyError(e)) {

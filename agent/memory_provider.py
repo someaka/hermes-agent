@@ -273,6 +273,17 @@ class MemoryProvider(ABC):
           should all have ``env_var`` set and this method stays no-op).
         """
 
+    def format_config_display(self, config: dict) -> list[tuple[str, str]]:
+        """Return clean (key, display_value) pairs for 'hermes memory status'.
+
+        Override this to customize how your provider's config appears.
+        Default prints raw dict values — override for cleaner output.
+
+        Example override:
+            return [("backends", "mnemosyne, openviking")]
+        """
+        return []
+
     def on_memory_write(
         self,
         action: str,

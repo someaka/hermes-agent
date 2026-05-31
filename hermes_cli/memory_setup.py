@@ -564,19 +564,26 @@ def cmd_status(args) -> None:
         top_config = mem_config.get(top_provider, {})
         if top_config:
             print(f"\n  ── {top_provider} ──")
-            for key, val in top_config.items():
-                if isinstance(val, dict) and val:
-                    items = ", ".join(
-                        f"{k}" if v in ({}, True) else f"{k}({v})"
-                        for k, v in val.items()
-                    )
-                    print(f"    {key}: {items}")
-                elif isinstance(val, dict) and not val:
-                    print(f"    {key}: (empty)")
-                elif isinstance(val, list):
-                    print(f"    {key}: {', '.join(str(v) for v in val)}")
-                else:
+            # Let the provider format its own config display if it can
+            providers = _get_available_providers()
+            provider_obj = next((p for n, _, p in providers if n == top_provider), None)
+            if provider_obj and hasattr(provider_obj, "format_config_display"):
+                for key, val in provider_obj.format_config_display(top_config):
                     print(f"    {key}: {val}")
+            else:
+                for key, val in top_config.items():
+                    if isinstance(val, dict) and val:
+                        items = ", ".join(
+                            f"{k}" if v in ({}, True) else f"{k}({v})"
+                            for k, v in val.items()
+                        )
+                        print(f"    {key}: {items}")
+                    elif isinstance(val, dict) and not val:
+                        print(f"    {key}: (empty)")
+                    elif isinstance(val, list):
+                        print(f"    {key}: {', '.join(str(v) for v in val)}")
+                    else:
+                        print(f"    {key}: {val}")
 
     # Show each active backend/provider with plugin status
     if active:

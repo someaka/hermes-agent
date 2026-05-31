@@ -546,14 +546,39 @@ def cmd_status(args) -> None:
     config = load_config()
     mem_config = config.get("memory", {})
     active = _get_configured_providers(config)
+    top_provider = mem_config.get("provider", "")
 
     print(f"\nMemory status\n" + "─" * 40)
     print(f"  Built-in:   always active")
-    if active:
+
+    # Show top-level provider (e.g. "multi")
+    if top_provider:
+        print(f"  Provider:   {top_provider}")
+    elif active:
         print(f"  Providers:  {', '.join(active)}")
     else:
         print(f"  Providers:  (none — built-in only)")
 
+    # If top-level provider has config (e.g. multi.backends), show it
+    if top_provider and top_provider not in active:
+        top_config = mem_config.get(top_provider, {})
+        if top_config:
+            print(f"\n  ── {top_provider} ──")
+            for key, val in top_config.items():
+                if isinstance(val, dict) and val:
+                    items = ", ".join(
+                        f"{k}" if v in ({}, True) else f"{k}({v})"
+                        for k, v in val.items()
+                    )
+                    print(f"    {key}: {items}")
+                elif isinstance(val, dict) and not val:
+                    print(f"    {key}: (empty)")
+                elif isinstance(val, list):
+                    print(f"    {key}: {', '.join(str(v) for v in val)}")
+                else:
+                    print(f"    {key}: {val}")
+
+    # Show each active backend/provider with plugin status
     if active:
         for provider_name in active:
             print(f"\n  ── {provider_name} ──")
@@ -561,7 +586,18 @@ def cmd_status(args) -> None:
             if provider_config:
                 print(f"  Config:")
                 for key, val in provider_config.items():
-                    print(f"    {key}: {val}")
+                    if isinstance(val, dict) and val:
+                        items = ", ".join(
+                            f"{k}" if v in ({}, True) else f"{k}({v})"
+                            for k, v in val.items()
+                        )
+                        print(f"    {key}: {items}")
+                    elif isinstance(val, dict) and not val:
+                        print(f"    {key}: (empty)")
+                    elif isinstance(val, list):
+                        print(f"    {key}: {', '.join(str(v) for v in val)}")
+                    else:
+                        print(f"    {key}: {val}")
 
             providers = _get_available_providers()
             found = any(name == provider_name for name, _, _ in providers)

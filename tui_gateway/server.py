@@ -4621,9 +4621,11 @@ def _notification_file_watcher() -> None:
     After consuming all lines, truncates the file to prevent unbounded
     growth.  Uses os.replace for atomic truncation.
     """
+    import hashlib
     import json as _json
 
     last_pos = 0
+    recent_hashes: set = set()  # dedup: content hashes of recently processed events
     while True:
         try:
             time.sleep(2.0)
@@ -4652,10 +4654,23 @@ def _notification_file_watcher() -> None:
                     pass
                 continue
 
+            # Compute the byte offset BEFORE processing so we can
+            # truncate only the data we already consumed — prevents
+            # re-reading the same lines on the next cycle.
+            consumed_end = last_pos + sum(len(l.encode("utf-8")) for l in new_lines)
+
             for line in new_lines:
                 line = line.strip()
                 if not line:
                     continue
+                # Dedup: skip events we already processed in a prior cycle.
+                evt_hash = hashlib.md5(line.encode("utf-8")).hexdigest()
+                if evt_hash in recent_hashes:
+                    continue
+                recent_hashes.add(evt_hash)
+                # Cap the dedup set to prevent unbounded growth.
+                if len(recent_hashes) > 200:
+                    recent_hashes = set(list(recent_hashes)[-100:])
                 try:
                     evt = _json.loads(line)
                 except (_json.JSONDecodeError, ValueError):
@@ -4702,13 +4717,20 @@ def _notification_file_watcher() -> None:
                             pass
 
             # After consuming, truncate the file to prevent growth.
+            # Use consumed_end (not last_pos) so we only remove data
+            # we already processed.  Don't reset last_pos — the file
+            # is now smaller, so future reads start at 0 anyway.
             try:
-                _tmp = _NOTIF_FILE.with_suffix(".tmp")
-                _tmp.write_text("", encoding="utf-8")
-                os.replace(str(_tmp), str(_NOTIF_FILE))
-                last_pos = 0
+                file_size = _NOTIF_FILE.stat().st_size
+                if file_size > 0:
+                    _tmp = _NOTIF_FILE.with_suffix(".tmp")
+                    _tmp.write_text("", encoding="utf-8")
+                    os.replace(str(_tmp), str(_NOTIF_FILE))
+                    last_pos = 0
             except OSError:
-                pass
+                # If truncation fails, advance last_pos so we don't
+                # re-read the same data next cycle.
+                last_pos = consumed_end
 
         except Exception:
             # Never crash the watcher — log and continue.

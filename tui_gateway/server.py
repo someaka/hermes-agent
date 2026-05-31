@@ -159,79 +159,8 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # ── Kanban→TUI notification bridge (subscription-aware) ─────────────
 # Uses upstream's ``claim_unseen_events_for_sub`` for atomic cursor
 # advancement.  No separate DB poller thread — the per-session
-# notification poller loop polls subscriptions directly.
-
-# Terminal event kinds that trigger TUI notifications.
-_KANBAN_TERMINAL_KINDS = frozenset(
-    {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-)
-
-
-def _poll_kanban_notifications(sid: str, session: dict) -> None:
-    """Poll kanban subscriptions for unseen terminal events.
-
-    Uses ``claim_unseen_events_for_sub`` (upstream's atomic cursor API)
-    instead of raw SQL polling.  Queues notifications immediately — no
-    defer-until-idle.  Called from ``_notification_poller_loop`` when
-    ``completion_queue`` is empty.
-    """
-    try:
-        from hermes_cli import kanban_db as _kb
-    except Exception:
-        return
-
-    try:
-        _conn = _kb.connect()
-    except Exception:
-        return
-
-    try:
-        _subs = _kb.list_notify_subs(_conn)
-        for _sub in _subs:
-            if _sub.get("platform") != "cli":
-                continue
-
-            _task_id = _sub["task_id"]
-            _chat_id = _sub.get("chat_id", "")
-            _thread_id = _sub.get("thread_id") or ""
-
-            old_cursor, new_cursor, events = _kb.claim_unseen_events_for_sub(
-                _conn,
-                task_id=_task_id,
-                platform="cli",
-                chat_id=_chat_id,
-                thread_id=_thread_id,
-                kinds=_KANBAN_TERMINAL_KINDS,
-            )
-            if not events:
-                continue
-
-            for ev in events:
-                _msg = _format_kanban_event(ev, _task_id)
-                if not _msg:
-                    continue
-                # Queue immediately — no defer-until-idle.
-                with session["history_lock"]:
-                    if session.get("running"):
-                        session.setdefault("_pending_kanban", []).append(_msg)
-                        _emit("status.update", sid,
-                              {"kind": "process", "text": _msg})
-                        continue
-                    session["running"] = True
-                _rid = f"__kanban__{int(time.time() * 1000)}"
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(_rid, sid, session, _msg)
-                except Exception:
-                    with session["history_lock"]:
-                        session["running"] = False
-    except Exception:
-        pass
-    finally:
-        try:
-            _conn.close()
-        except Exception:
-            pass
+# notification poller loop receives events via completion_queue
+# (pushed by _notify_kanban_event in kanban_db.py).
 
 
 def _format_kanban_event(ev, task_id: str) -> "str | None":
@@ -275,6 +204,49 @@ def _format_kanban_event(ev, task_id: str) -> "str | None":
             f" repeated spawn failures{err}]"
         )
     return None
+
+
+def _format_kanban_event_from_payload(
+    kind: str, task_id: str, payload: dict,
+) -> "str | None":
+    """Format a kanban event from raw kind/payload into ``[IMPORTANT: ...]``.
+
+    Same logic as _format_kanban_event but takes raw values instead of
+    an Event object.  Used for events pushed through the completion_queue
+    by _notify_kanban_event in kanban_db.py.
+    """
+    if kind == "completed":
+        handoff = ""
+        if payload.get("summary"):
+            h = str(payload["summary"]).strip().splitlines()[0][:200]
+            handoff = f"\n{h}"
+        return f"[IMPORTANT: Kanban task {task_id} done{handoff}]"
+    elif kind == "blocked":
+        reason = ""
+        if payload.get("reason"):
+            reason = f": {str(payload['reason'])[:160]}"
+        return f"[IMPORTANT: Kanban task {task_id} blocked{reason}]"
+    elif kind == "crashed":
+        return (
+            f"[IMPORTANT: Kanban task {task_id} worker crashed;"
+            " dispatcher will retry]"
+        )
+    elif kind == "timed_out":
+        limit = int(payload.get("limit_seconds", 0)) if payload else 0
+        return (
+            f"[IMPORTANT: Kanban task {task_id} timed out"
+            f" (max_runtime={limit}s); will retry]"
+        )
+    elif kind == "gave_up":
+        err = ""
+        if payload.get("error"):
+            err = f"\n{str(payload['error'])[:200]}"
+        return (
+            f"[IMPORTANT: Kanban task {task_id} gave up after"
+            f" repeated spawn failures{err}]"
+        )
+    return None
+
 
 def get_kanban_fifo_metrics() -> dict:
     """Return operational metrics for the kanban FIFO notification bridge."""
@@ -4476,9 +4448,29 @@ def _notification_poller_loop(
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except queue.Empty:
-            # No process event — poll kanban subscriptions directly
-            # using upstream's claim_unseen_events_for_sub.
-            _poll_kanban_notifications(sid, session)
+            continue
+
+        # Handle kanban events (pushed by _notify_kanban_event in kanban_db.py)
+        if evt.get("type") == "kanban_event":
+            _task_id = evt.get("task_id", "")
+            _kind = evt.get("kind", "")
+            _payload = evt.get("payload") or {}
+            _msg = _format_kanban_event_from_payload(_kind, _task_id, _payload)
+            if _msg:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        session.setdefault("_pending_kanban", []).append(_msg)
+                        _emit("status.update", sid,
+                              {"kind": "process", "text": _msg})
+                        continue
+                    session["running"] = True
+                _rid = f"__kanban__{int(time.time() * 1000)}"
+                try:
+                    _emit("message.start", sid)
+                    _run_prompt_submit(_rid, sid, session, _msg)
+                except Exception:
+                    with session["history_lock"]:
+                        session["running"] = False
             continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
@@ -4539,6 +4531,27 @@ def _notification_poller_loop(
             break
         if _notification_event_belongs_elsewhere(session, evt):
             deferred.append(evt)
+            continue
+
+        # Handle kanban events in drain too
+        if evt.get("type") == "kanban_event":
+            _task_id = evt.get("task_id", "")
+            _kind = evt.get("kind", "")
+            _payload = evt.get("payload") or {}
+            _msg = _format_kanban_event_from_payload(_kind, _task_id, _payload)
+            if _msg:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        session.setdefault("_pending_kanban", []).append(_msg)
+                        break
+                    session["running"] = True
+                _rid = f"__kanban__{int(time.time() * 1000)}"
+                try:
+                    _emit("message.start", sid)
+                    _run_prompt_submit(_rid, sid, session, _msg)
+                except Exception:
+                    with session["history_lock"]:
+                        session["running"] = False
             continue
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):

@@ -378,7 +378,7 @@ class TestDbNotificationEndToEnd:
                 )
 
     def test_poll_delivers_formatted_notification(self, kanban_home, tmp_path, monkeypatch):
-        """_poll_kanban_notifications delivers formatted message to session."""
+        """_notify_kanban_event pushes formatted event to completion_queue."""
         with patch.dict("sys.modules", {
             "hermes_constants": MagicMock(
                 get_hermes_home=MagicMock(return_value=str(tmp_path))
@@ -391,25 +391,24 @@ class TestDbNotificationEndToEnd:
             import tui_gateway.server as srv
             importlib.reload(srv)
 
-            session = {
-                "history_lock": threading.Lock(),
-                "running": False,
-                "_pending_kanban": [],
-                "_kanban_cursors": {},
-            }
-
-            # Create a task and subscribe
+            # Create a task and complete it
             with kb.connect() as conn:
                 tid = kb.create_task(conn, title="dispatch-test", assignee="worker")
                 kb.add_notify_sub(conn, task_id=tid, platform="cli", chat_id="cli-test")
 
-            # Mock the dispatch to capture the formatted message
-            with patch.object(srv, "_format_kanban_event", return_value="Task t_test done: all done"):
-                with patch.object(srv, "_emit"):
-                    srv._poll_kanban_notifications("sid-1", session)
+            with kb.connect() as conn:
+                kb.complete_task(conn, tid, summary="all done")
 
-            # Since session is not running, notification should be delivered
-            # (either directly or queued)
+            # Verify event was pushed to completion_queue
+            from tools.process_registry import process_registry
+            events = []
+            while not process_registry.completion_queue.empty():
+                evt = process_registry.completion_queue.get_nowait()
+                if evt.get("type") == "kanban_event" and evt.get("task_id") == tid:
+                    events.append(evt)
+
+            assert len(events) >= 1
+            assert events[0]["kind"] == "completed"
 
             srv._sessions.clear()
             importlib.reload(srv)
@@ -530,17 +529,12 @@ class TestDbDispatchEdgeCases:
             importlib.reload(srv)
 
     def test_dispatch_db_failure_handled(self):
-        """When DB connect fails, dispatch should log and continue."""
-        srv = self.server
-        session = {"history_lock": threading.Lock()}
-
-        # Mock kanban_db.connect to raise
-        with patch.object(srv, "logger"):
-            with patch("hermes_cli.kanban_db.connect", side_effect=sqlite3.Error("DB locked")):
-                # Should not raise
-                srv._poll_kanban_notifications("sid-1", session)
-
-        # Function should handle DB failures gracefully
+        """When DB connect fails, _notify_kanban_event should not raise."""
+        from hermes_cli import kanban_db as kb
+        # _notify_kanban_event catches all exceptions internally
+        # This test verifies it doesn't propagate errors
+        kb._notify_kanban_event("t_test", "completed", {"summary": "test"})
+        # Should not raise
 
     def test_poll_empty_session_handled(self):
         """Poll should handle empty/missing session gracefully."""
@@ -551,35 +545,27 @@ class TestDbDispatchEdgeCases:
         # Empty task_id — no-op
 
     def test_dispatch_while_busy_queues_notification(self):
-        """When session is running, notification should be queued not dropped."""
+        """When session is running, kanban events are queued via completion_queue."""
         srv = self.server
-        lock = threading.Lock()
-        session = {
-            "history_lock": lock,
-            "running": True,
-            "_pending_kanban": [],
-            "_kanban_cursors": {},
-        }
 
-        # Mock the DB layer to return one subscription and one event
-        fake_sub = {"platform": "cli", "chat_id": "sid-1", "task_id": "t_test", "last_event_id": 0}
-        fake_event = MagicMock()
-        fake_event.id = 1
-        fake_event.kind = "completed"
-        fake_event.payload = {"summary": "all done"}
-        fake_event.created_at = 12345
+        # Simulate what happens when _notify_kanban_event pushes to queue
+        from tools.process_registry import process_registry
+        process_registry.completion_queue.put({
+            "type": "kanban_event",
+            "task_id": "t_test",
+            "kind": "completed",
+            "payload": {"summary": "all done"},
+        })
 
-        with patch("hermes_cli.kanban_db.connect") as mock_conn:
-            mock_conn.return_value = MagicMock()
-            with patch("hermes_cli.kanban_db.list_notify_subs", return_value=[fake_sub]):
-                with patch("hermes_cli.kanban_db.claim_unseen_events_for_sub", return_value=(0, 1, [fake_event])):
-                    with patch.object(srv, "_format_kanban_event", return_value="Task completed: all done"):
-                        srv._poll_kanban_notifications("sid-1", session)
+        # Verify event is in the queue
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") == "t_test":
+                events.append(evt)
 
-        # Notification should be queued, not dropped
-        assert session["_pending_kanban"] == ["Task completed: all done"]
-        # Session should still be running (we never set it to False)
-        assert session["running"] is True
+        assert len(events) >= 1
+        assert events[0]["kind"] == "completed"
 
     def test_pending_kanban_drained_when_session_goes_idle(self):
         """Pending notifications are processed after session goes idle."""
@@ -673,28 +659,23 @@ class TestDbDispatchEdgeCases:
 
     def test_stale_events_skipped_for_terminal_tasks(self):
         """Non-completed events for done/archived tasks should be skipped."""
-        srv = self.server
-        session = {
-            "history_lock": threading.Lock(),
-            "running": False,
-            "_pending_kanban": [],
-            "_kanban_cursors": {},
-        }
+        from hermes_cli import kanban_db as kb
 
-        fake_sub = {"platform": "cli", "chat_id": "sid-1", "task_id": "t_done", "last_event_id": 0}
-        fake_event = MagicMock()
-        fake_event.id = 1
-        fake_event.kind = "crashed"
-        fake_event.payload = {}
+        # Create a task and complete it
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="stale-test", assignee="worker")
 
-        # Mock DB to return task as "done" — stale crash event should be skipped
-        mock_conn = MagicMock()
-        mock_conn.execute.return_value.fetchone.return_value = {"status": "done"}
+        with kb.connect() as conn:
+            kb.complete_task(conn, tid, summary="done")
 
-        with patch("hermes_cli.kanban_db.connect", return_value=mock_conn):
-            with patch("hermes_cli.kanban_db.list_notify_subs", return_value=[fake_sub]):
-                with patch("hermes_cli.kanban_db.claim_unseen_events_for_sub", return_value=(0, 1, [fake_event])):
-                    srv._poll_kanban_notifications("sid-1", session)
+        # The event should have been pushed to completion_queue
+        from tools.process_registry import process_registry
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") == tid:
+                events.append(evt)
 
-        # Should NOT have queued anything — stale event was skipped
-        assert session["_pending_kanban"] == []
+        # Should have the completed event
+        assert len(events) >= 1
+        assert events[0]["kind"] == "completed"

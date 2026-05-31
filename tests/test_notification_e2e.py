@@ -120,7 +120,7 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-        # Simulate the DB poller query (same SQL as _start_global_kanban_db_poller)
+        # Simulate the DB poller query (same SQL as _poll_kanban_notifications)
         conn = kb.connect()
         try:
             terminal_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
@@ -233,7 +233,7 @@ class TestNotificationDeliveryE2E:
         # Test completed with summary
         ev = SimpleNamespace(kind="completed", payload={"summary": "shipped it"})
         sub = {"task_id": "t_test1", "platform": "cli", "chat_id": "s1"}
-        msg = srv._format_kanban_notification(ev, sub)
+        msg = srv._format_kanban_event(ev, sub)
         assert msg is not None
         assert "t_test1" in msg
         assert "done" in msg
@@ -242,7 +242,7 @@ class TestNotificationDeliveryE2E:
         # Test blocked with reason
         ev = SimpleNamespace(kind="blocked", payload={"reason": "need API key"})
         sub = {"task_id": "t_test2", "platform": "cli", "chat_id": "s1"}
-        msg = srv._format_kanban_notification(ev, sub)
+        msg = srv._format_kanban_event(ev, sub)
         assert msg is not None
         assert "t_test2" in msg
         assert "blocked" in msg
@@ -251,7 +251,7 @@ class TestNotificationDeliveryE2E:
         # Test crashed
         ev = SimpleNamespace(kind="crashed", payload=None)
         sub = {"task_id": "t_test3", "platform": "cli", "chat_id": "s1"}
-        msg = srv._format_kanban_notification(ev, sub)
+        msg = srv._format_kanban_event(ev, sub)
         assert msg is not None
         assert "t_test3" in msg
         assert "crashed" in msg
@@ -259,7 +259,7 @@ class TestNotificationDeliveryE2E:
         # Test timed_out
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": 300})
         sub = {"task_id": "t_test4", "platform": "cli", "chat_id": "s1"}
-        msg = srv._format_kanban_notification(ev, sub)
+        msg = srv._format_kanban_event(ev, sub)
         assert msg is not None
         assert "t_test4" in msg
         assert "timed out" in msg
@@ -268,13 +268,13 @@ class TestNotificationDeliveryE2E:
         # Test gave_up
         ev = SimpleNamespace(kind="gave_up", payload={"error": "spawn failed 3x"})
         sub = {"task_id": "t_test5", "platform": "cli", "chat_id": "s1"}
-        msg = srv._format_kanban_notification(ev, sub)
+        msg = srv._format_kanban_event(ev, sub)
         assert msg is not None
         assert "t_test5" in msg
         assert "gave up" in msg
 
     def test_dispatch_delivers_to_matching_session(self, kanban_home, server_module):
-        """Step 7: Verify _dispatch_kanban_notification injects into the right session."""
+        """Step 7: Verify _poll_kanban_notifications injects into the right session."""
         srv = server_module
 
         conn = kb.connect()
@@ -301,9 +301,9 @@ class TestNotificationDeliveryE2E:
 
         with patch.object(srv, "_run_prompt_submit", side_effect=fake_run_prompt):
             with patch.object(srv, "_emit"):
-                srv._dispatch_kanban_notification(
+                srv._poll_kanban_notifications(
                     "cli-sess-1", session,
-                    {"task_id": tid, "kind": "completed"},
+                    
                 )
 
         # Should have delivered the notification
@@ -332,10 +332,10 @@ class TestNotificationDeliveryE2E:
         srv._sessions["cli-busy-1"] = session
 
         with patch.object(srv, "_emit"):
-            srv._dispatch_kanban_notification(
+            srv._poll_kanban_notifications(
                 "cli-busy-1", session,
-                {"task_id": tid, "kind": "completed"},
-            )
+                
+                )
 
         # Should be queued, not delivered immediately
         assert len(session["_pending_kanban"]) == 1
@@ -367,9 +367,9 @@ class TestNotificationDeliveryE2E:
 
         with patch.object(srv, "_run_prompt_submit", side_effect=capture_msg):
             with patch.object(srv, "_emit"):
-                srv._dispatch_kanban_notification(
+                srv._poll_kanban_notifications(
                     "cli-platform-1", session,
-                    {"task_id": tid, "kind": "completed"},
+                    
                 )
 
         # Should NOT deliver -- subscription is for telegram, not cli
@@ -428,9 +428,9 @@ class TestNotificationDeliveryE2E:
 
         with patch.object(srv, "_run_prompt_submit", side_effect=capture):
             with patch.object(srv, "_emit"):
-                srv._dispatch_kanban_notification(
+                srv._poll_kanban_notifications(
                     "e2e-sess", session,
-                    {"task_id": tid, "kind": "completed"},
+                    
                 )
 
         # Phase 5: Verify delivery
@@ -490,13 +490,13 @@ class TestNotificationDeliveryE2E:
 
         with patch.object(srv, "_run_prompt_submit", side_effect=capture):
             with patch.object(srv, "_emit"):
-                srv._dispatch_kanban_notification(
+                srv._poll_kanban_notifications(
                     "multi-sess", session,
-                    {"task_id": tid1, "kind": "completed"},
+                    
                 )
-                srv._dispatch_kanban_notification(
+                srv._poll_kanban_notifications(
                     "multi-sess", session,
-                    {"task_id": tid2, "kind": "completed"},
+                    
                 )
 
         assert len(delivered) == 2
@@ -537,61 +537,40 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-    def test_global_db_poller_queue_integration(self, kanban_home, server_module):
-        """Step 13: Verify the global DB poller thread pushes events to the in-memory queue."""
-        srv = server_module
-
+    def test_subscription_claim_returns_events(self, kanban_home, server_module):
+        """Step 13: Verify claim_unseen_events_for_sub returns terminal events."""
         conn = kb.connect()
         try:
-            tid = kb.create_task(conn, title="queue-test", assignee="worker")
-            kb.complete_task(conn, tid, summary="queue done")
+            tid = kb.create_task(conn, title="claim-test", assignee="worker")
+            kb.add_notify_sub(conn, task_id=tid, platform="cli", chat_id="cli-test")
+            kb.complete_task(conn, tid, summary="claimed")
         finally:
             conn.close()
 
-        # The global poller runs in a background thread. Give it a moment
-        # to pick up the event. If it's not running (test environment),
-        # simulate the poller logic directly.
-        time.sleep(3)
-
-        # Check if the queue has our event
-        found = False
+        conn = kb.connect()
         try:
-            while True:
-                data = srv._kanban_event_queue.get_nowait()
-                if data.get("task_id") == tid and data.get("kind") == "completed":
-                    found = True
-                    break
-        except queue.Empty:
-            pass
+            old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
+                conn,
+                task_id=tid,
+                platform="cli",
+                chat_id="cli-test",
+                kinds=("completed", "blocked", "gave_up", "crashed", "timed_out"),
+            )
+        finally:
+            conn.close()
+        assert len(events) >= 1
+        assert events[0].kind == "completed"
+        assert new_cursor > old_cursor
 
-        # In test env the poller may not have started; verify the query works
-        if not found:
-            conn = kb.connect()
-            try:
-                terminal_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-                rows = conn.execute(
-                    "SELECT id, task_id, kind FROM task_events "
-                    "WHERE kind IN ({})".format(
-                        ",".join("?" for _ in terminal_kinds)
-                    ),
-                    tuple(terminal_kinds),
-                ).fetchall()
-                found = any(r["task_id"] == tid for r in rows)
-            finally:
-                conn.close()
-
-        assert found, "Completed event should be detectable by DB poller"
-
-    def test_metrics_tracking(self, kanban_home, server_module):
-        """Step 14: Verify notification metrics are tracked."""
+    def test_format_handles_all_terminal_kinds(self, kanban_home, server_module):
+        """Step 14: Verify _format_kanban_event handles all terminal event kinds."""
         srv = server_module
 
-        # Metrics should be accessible
-        metrics = srv.get_kanban_event_metrics()
-        assert "queue_depth" in metrics
-        assert "queue_maxsize" in metrics
-        assert "dropped_count" in metrics
-        assert "received_count" in metrics
-        assert "dispatch_failures" in metrics
-        assert isinstance(metrics["queue_depth"], int)
-        assert isinstance(metrics["queue_maxsize"], int)
+        from unittest.mock import MagicMock
+        for kind in ("completed", "blocked", "gave_up", "crashed", "timed_out"):
+            ev = MagicMock()
+            ev.kind = kind
+            ev.payload = {"summary": "test", "reason": "test", "error": "test", "limit_seconds": 60}
+            msg = srv._format_kanban_event(ev, "t_test")
+            assert msg is not None, f"_format_kanban_event returned None for kind={kind}"
+            assert "[IMPORTANT:" in msg

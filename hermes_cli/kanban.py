@@ -1399,9 +1399,10 @@ def _auto_subscribe_cli(task_id: str) -> None:
 
     Uses ``platform='cli'`` with ``chat_id=f'cli-{os.getpid()}'`` so that
     a CLI-side notification drain can later claim and deliver terminal-state
-    events to the user.  Only one subscription is needed — the gateway
-    maps both ``cli`` and ``tui`` platforms to the same TUIAdapter, so
-    subscribing to both would cause double delivery.
+    events to the user.  Also subscribes ``platform='tui'`` so the gateway's
+    TUIAdapter delivers terminal events to the TUI server via the shared
+    notification file.  The gateway's watcher deduplicates by adapter
+    instance — both subscriptions coexist without double delivery.
     """
     try:
         from hermes_cli import kanban_db as _kb
@@ -1413,6 +1414,12 @@ def _auto_subscribe_cli(task_id: str) -> None:
                 chat_id=f"cli-{_os.getpid()}",
                 thread_id=None,
                 user_id=None,
+                notifier_profile=_profile_author(),
+            )
+            _kb.add_notify_sub(
+                _conn, task_id=task_id,
+                platform="tui",
+                chat_id="tui",
                 notifier_profile=_profile_author(),
             )
     except Exception as exc:

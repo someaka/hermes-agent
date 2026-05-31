@@ -5324,6 +5324,11 @@ class GatewayRunner:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                # Dedup: when multiple subscriptions map to the same
+                # adapter (e.g. cli and tui both → TUIAdapter), deliver
+                # each event once per adapter instance, not once per
+                # subscription.  Key: (adapter_id, task_id, event_kind).
+                delivered: set = set()
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -5418,6 +5423,18 @@ class GatewayRunner:
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
+                        # Skip if this adapter already delivered this
+                        # event (handles multiple subscriptions mapping
+                        # to the same adapter instance, e.g. cli+tui).
+                        dedup_key = (id(adapter), sub["task_id"], kind)
+                        if dedup_key in delivered:
+                            # Still advance the cursor so the dup sub
+                            # doesn't replay on the next tick.
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                        delivered.add(dedup_key)
                         try:
                             await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
@@ -10289,25 +10306,23 @@ class GatewayRunner:
                         # Also subscribe TUI platform so the gateway's
                         # TUIAdapter delivers terminal events to the
                         # TUI server via the shared notification file.
-                        # Skip when source is already 'cli' — both cli
-                        # and tui map to the same TUIAdapter, so a
-                        # second subscription would cause double delivery.
-                        if platform_str != "cli":
-                            try:
-                                def _sub_tui():
-                                    from hermes_cli import kanban_db as _kb
-                                    conn2 = _kb.connect(board=requested_board)
-                                    try:
-                                        _kb.add_notify_sub(
-                                            conn2, task_id=task_id,
-                                            platform="tui", chat_id="tui",
-                                            notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                        )
-                                    finally:
-                                        conn2.close()
-                                await asyncio.to_thread(_sub_tui)
-                            except Exception:
-                                pass
+                        # The watcher deduplicates by adapter instance,
+                        # so both subscriptions coexist safely.
+                        try:
+                            def _sub_tui():
+                                from hermes_cli import kanban_db as _kb
+                                conn2 = _kb.connect(board=requested_board)
+                                try:
+                                    _kb.add_notify_sub(
+                                        conn2, task_id=task_id,
+                                        platform="tui", chat_id="tui",
+                                        notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    )
+                                finally:
+                                    conn2.close()
+                            await asyncio.to_thread(_sub_tui)
+                        except Exception:
+                            pass
                         output = (
                             output.rstrip()
                             + "\n"

@@ -4712,20 +4712,15 @@ class GatewayRunner:
         # so human-in-the-loop workflows hear back without polling.
         #
         # Register TUI platform adapter so the notifier can deliver to
-        # connected TUI/CLI sessions via push_kanban_event.
+        # connected TUI/CLI sessions.  The adapter writes events to a
+        # JSON-lines file; the TUI server's watcher thread reads the
+        # other end — bridging the gateway↔TUI process boundary via
+        # cross-platform file I/O (no in-process callback needed).
         try:
             from gateway.platforms.tui_adapter import TUIAdapter
             from gateway.config import PlatformConfig
             _tui_cfg = PlatformConfig(enabled=True)
             _tui_adapter = TUIAdapter(_tui_cfg, Platform("tui"))
-            from tui_gateway.server import push_kanban_event
-            _tui_adapter.set_delivery_callback(
-                lambda chat_id, content, meta: push_kanban_event(
-                    meta.get("task_id", chat_id),
-                    meta.get("kind", "completed"),
-                    meta.get("payload", {"summary": content}),
-                )
-            )
             await _tui_adapter.start()
             self.adapters[Platform("tui")] = _tui_adapter
             self.adapters[Platform("cli")] = _tui_adapter
@@ -10291,8 +10286,9 @@ class GatewayRunner:
                             finally:
                                 conn.close()
                         await asyncio.to_thread(_sub)
-                        # Also subscribe TUI platform so the TUI adapter
-                        # receives terminal events via push_kanban_event.
+                        # Also subscribe TUI platform so the gateway's
+                        # TUIAdapter delivers terminal events to the
+                        # TUI server via the shared notification file.
                         try:
                             def _sub_tui():
                                 from hermes_cli import kanban_db as _kb

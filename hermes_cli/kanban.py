@@ -1399,8 +1399,9 @@ def _auto_subscribe_cli(task_id: str) -> None:
 
     Uses ``platform='cli'`` with ``chat_id=f'cli-{os.getpid()}'`` so that
     a CLI-side notification drain can later claim and deliver terminal-state
-    events to the user.  Also subscribes ``platform='tui'`` so the gateway's
-    TUI adapter receives events via push_kanban_event.
+    events to the user.  Also subscribes ``platform='tui'`` so the gateway's TUIAdapter
+  delivers terminal events to the TUI server via the shared
+  notification file.
     """
     try:
         from hermes_cli import kanban_db as _kb

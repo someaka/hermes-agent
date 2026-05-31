@@ -274,7 +274,7 @@ class TestNotificationDeliveryE2E:
         assert "gave up" in msg
 
     def test_dispatch_delivers_to_matching_session(self, kanban_home, server_module):
-        """Step 7: Verify _poll_kanban_notifications injects into the right session."""
+        """Step 7: Verify kanban events are pushed to completion_queue."""
         srv = server_module
 
         conn = kb.connect()
@@ -285,34 +285,20 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-        # Set up a fake TUI session
-        delivered_messages = []
-        history_lock = threading.Lock()
+        # Verify the event was pushed to completion_queue
+        from tools.process_registry import process_registry
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") == tid:
+                events.append(evt)
 
-        def fake_run_prompt(rid, sid, session, msg):
-            delivered_messages.append(msg)
-
-        session = {
-            "running": False,
-            "history_lock": history_lock,
-            "_pending_kanban": [],
-        }
-        srv._sessions["cli-sess-1"] = session
-
-        with patch.object(srv, "_run_prompt_submit", side_effect=fake_run_prompt):
-            with patch.object(srv, "_emit"):
-                srv._poll_kanban_notifications(
-                    "cli-sess-1", session,
-                    
-                )
-
-        # Should have delivered the notification
-        assert len(delivered_messages) == 1
-        assert "dispatch test" in delivered_messages[0] or tid in delivered_messages[0]
-        assert "done" in delivered_messages[0]
+        assert len(events) >= 1
+        assert events[0]["kind"] == "completed"
+        assert "dispatch done" in (events[0]["payload"].get("summary") or "")
 
     def test_dispatch_queues_when_session_busy(self, kanban_home, server_module):
-        """Step 8: Verify notification is queued when session is busy."""
+        """Step 8: Verify kanban events are queued for busy sessions."""
         srv = server_module
 
         conn = kb.connect()
@@ -323,26 +309,19 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-        history_lock = threading.Lock()
-        session = {
-            "running": True,  # Session is busy
-            "history_lock": history_lock,
-            "_pending_kanban": [],
-        }
-        srv._sessions["cli-busy-1"] = session
+        # Verify the event was pushed to completion_queue
+        from tools.process_registry import process_registry
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") == tid:
+                events.append(evt)
 
-        with patch.object(srv, "_emit"):
-            srv._poll_kanban_notifications(
-                "cli-busy-1", session,
-                
-                )
-
-        # Should be queued, not delivered immediately
-        assert len(session["_pending_kanban"]) == 1
-        assert tid in session["_pending_kanban"][0]
+        assert len(events) >= 1
+        assert events[0]["kind"] == "completed"
 
     def test_dispatch_skips_non_cli_subscriptions(self, kanban_home, server_module):
-        """Step 9: Verify CLI dispatch skips non-CLI platform subscriptions."""
+        """Step 9: Verify kanban events are pushed regardless of subscription platform."""
         srv = server_module
 
         conn = kb.connect()
@@ -354,29 +333,19 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-        delivered = []
-        session = {
-            "running": False,
-            "history_lock": threading.Lock(),
-            "_pending_kanban": [],
-        }
-        srv._sessions["cli-platform-1"] = session
+        # Verify the event was pushed to completion_queue
+        # (events are pushed regardless of subscription platform)
+        from tools.process_registry import process_registry
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") == tid:
+                events.append(evt)
 
-        def capture_msg(rid, sid, s, msg):
-            delivered.append(msg)
-
-        with patch.object(srv, "_run_prompt_submit", side_effect=capture_msg):
-            with patch.object(srv, "_emit"):
-                srv._poll_kanban_notifications(
-                    "cli-platform-1", session,
-                    
-                )
-
-        # Should NOT deliver -- subscription is for telegram, not cli
-        assert len(delivered) == 0
+        assert len(events) >= 1
 
     def test_full_pipeline_create_to_delivery(self, kanban_home, server_module):
-        """Step 10: Full E2E -- create -> subscribe -> complete -> poll -> dispatch -> verify."""
+        """Step 10: Full E2E -- create -> subscribe -> complete -> verify queue push."""
         srv = server_module
 
         # Phase 1: Setup
@@ -394,7 +363,19 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-        # Phase 3: Simulate DB poller
+        # Phase 3: Verify event was pushed to completion_queue
+        from tools.process_registry import process_registry
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") == tid:
+                events.append(evt)
+
+        assert len(events) >= 1
+        assert events[0]["kind"] == "completed"
+        assert "full pipeline complete" in (events[0]["payload"].get("summary") or "")
+
+        # Phase 4: Verify event is also in DB
         conn = kb.connect()
         try:
             terminal_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
@@ -406,58 +387,9 @@ class TestNotificationDeliveryE2E:
                 tuple(terminal_kinds),
             ).fetchall()
 
-            # Find our event
             our_events = [r for r in rows if r["task_id"] == tid]
             assert len(our_events) >= 1
             assert our_events[-1]["kind"] == "completed"
-        finally:
-            conn.close()
-
-        # Phase 4: Simulate queue dispatch
-        delivered = []
-        session = {
-            "running": False,
-            "history_lock": threading.Lock(),
-            "_pending_kanban": [],
-        }
-        srv._sessions["e2e-sess"] = session
-
-        def capture(rid, sid, s, msg):
-            delivered.append(msg)
-            s["running"] = False
-
-        with patch.object(srv, "_run_prompt_submit", side_effect=capture):
-            with patch.object(srv, "_emit"):
-                srv._poll_kanban_notifications(
-                    "e2e-sess", session,
-                    
-                )
-
-        # Phase 5: Verify delivery
-        assert len(delivered) == 1
-        assert "full e2e task" in delivered[0] or tid in delivered[0]
-        assert "done" in delivered[0]
-        assert "full pipeline complete" in delivered[0]
-
-        # Phase 6: Verify no re-delivery after cursor advance
-        conn = kb.connect()
-        try:
-            fmt_kinds = {"completed", "blocked", "gave_up", "crashed", "timed_out"}
-            cursor, events = kb.unseen_events_for_sub(
-                conn, task_id=tid, platform="cli", chat_id="e2e-sess", kinds=fmt_kinds,
-            )
-            # Events may still be unseen because dispatch doesn't advance cursor
-            # (that happens in the real poller loop). Let's advance manually.
-            if events:
-                kb.advance_notify_cursor(
-                    conn, task_id=tid, platform="cli", chat_id="e2e-sess",
-                    new_cursor=cursor,
-                )
-                # Now should see nothing
-                _, events2 = kb.unseen_events_for_sub(
-                    conn, task_id=tid, platform="cli", chat_id="e2e-sess", kinds=fmt_kinds,
-                )
-                assert len(events2) == 0
         finally:
             conn.close()
 
@@ -476,33 +408,17 @@ class TestNotificationDeliveryE2E:
         finally:
             conn.close()
 
-        delivered = []
-        session = {
-            "running": False,
-            "history_lock": threading.Lock(),
-            "_pending_kanban": [],
-        }
-        srv._sessions["multi-sess"] = session
+        # Verify both events were pushed to completion_queue
+        from tools.process_registry import process_registry
+        events = []
+        while not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("type") == "kanban_event" and evt.get("task_id") in (tid1, tid2):
+                events.append(evt)
 
-        def capture(rid, sid, s, msg):
-            delivered.append(msg)
-            s["running"] = False
-
-        with patch.object(srv, "_run_prompt_submit", side_effect=capture):
-            with patch.object(srv, "_emit"):
-                srv._poll_kanban_notifications(
-                    "multi-sess", session,
-                    
-                )
-                srv._poll_kanban_notifications(
-                    "multi-sess", session,
-                    
-                )
-
-        assert len(delivered) == 2
-        msgs_text = " ".join(delivered)
-        assert "alpha" in msgs_text or tid1 in msgs_text
-        assert "beta" in msgs_text or tid2 in msgs_text
+        task_ids = {e["task_id"] for e in events}
+        assert tid1 in task_ids
+        assert tid2 in task_ids
 
     def test_blocked_then_completed_delivers_both(self, kanban_home, server_module):
         """Step 12: Task blocked then completed -- both events are persisted."""

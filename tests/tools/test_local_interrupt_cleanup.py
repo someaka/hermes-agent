@@ -48,13 +48,15 @@ def _process_group_snapshot(pgid: int) -> str:
     ).stdout.strip()
 
 
-def _wait_for_pgid_exit(pgid: int, timeout: float = 30.0) -> bool:
-    """Wait for a process group to disappear under loaded xdist hosts.
+def _wait_for_pgid_exit(pgid: int, timeout: float = 10.0) -> bool:
+    """Wait for a process group to disappear after SIGKILL.
 
-    The cleanup chain is: SIGTERM → 3s TimeoutStopSec → SIGKILL → reap.
-    Under heavy xdist load (40 parallel workers, 6-shard CI), the full
-    sequence can exceed 10s. Default timeout is generous to avoid CI
-    flakes; in practice the wait returns in <1s on quiet hosts.
+    After SIGKILL the kernel reaps the process immediately — 10s is
+    extremely generous.  The timeout must stay well below the global
+    pytest-timeout (30s, set in pyproject.toml) so the test fails with
+    a clear assertion ("STILL ALIVE") instead of a confusing hard timeout.
+
+    Budget: kill chain (~5s) + pgid exit (10s) = 15s worst case < 30s.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -171,11 +173,10 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
         assert ret == 1, f"SetAsyncExc returned {ret}, expected 1"
 
         # Give the worker a moment to: hit the exception at the next poll,
-        # run the except-block cleanup (_kill_process), and exit.  Under
-        # xdist load the SIGTERM → 3s wait → SIGKILL chain can take longer
-        # than 5s before the worker's join() returns; bumped to 15s.
-        t.join(timeout=15.0)
-        assert not t.is_alive(), "worker didn't exit within 15 s of the interrupt"
+        # run the except-block cleanup (_kill_process), and exit.  Kill chain
+        # is SIGTERM(1s) + SIGKILL(2s) + drain(2s) ≈ 5s worst case.
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "worker didn't exit within 10 s of the interrupt"
 
         # The critical assertion: the subprocess GROUP must be dead.  Not
         # just the bash wrapper — the 'sleep 30' child too. Under xdist load,

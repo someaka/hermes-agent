@@ -7,18 +7,24 @@ messages before they reach external clients or LLM context.
 import re
 
 # Known filesystem root directory names.
+# NOTE: ``api`` is deliberately excluded — it is a common URL path segment
+# (e.g. ``/api/v1/chat/completions``) and NOT a standard Unix filesystem
+# root.  Adding it here would cause the regex to clobber legitimate API
+# endpoint references in error messages.  The negative lookbehind in
+# ``_UNIX_PATH`` further guards against partial matches inside longer paths.
 _FS_ROOTS = (
     r'(?:home|Users|opt|var|tmp|etc|usr|root|srv|proc|sys|dev|mnt|'
     r'media|run|boot|lib|bin|sbin|snap|nix|private)'
 )
 
 # Match an absolute Unix path rooted at a known FS directory.
-# - `(?<![\w/])` prevents matching inside longer paths or identifiers
-#   (e.g. /api/v1/home/user stays unmatched because of the leading /api).
-# - Requires at least 2 segments after the root so short fragments like
-#   /home/user are not clobbered — only full paths like /home/user/file.
-# - Negative lookahead `(?!/v\d/)` right after the root name prevents
-#   matching API-style continuations like /var/lib/v1/chat.
+# Guards:
+#   - (?<![\w/]) — not preceded by word char or / (prevents matching
+#     inside longer paths like /data/var/log).
+#   - (?!/v\d/) — negative lookahead right after the root name prevents
+#     matching API-style continuations like /var/lib/v1/chat.
+#   - Requires ≥ 2 additional segments after the root so short fragments
+#     like /home/user are preserved — only deep paths are redacted.
 _UNIX_PATH = re.compile(
     r'(?<![\w/])'                    # not preceded by word char or /
     r'/' + _FS_ROOTS +               # /<root>

@@ -60,7 +60,7 @@ class TestLoopCommandCLI:
             cli._handle_loop_command("/loop")
 
         captured = capsys.readouterr()
-        assert "(^_^) /loop" in captured.out
+        assert "/loop" in captured.out
         assert "Usage:" in captured.out
         assert "No loop jobs" in captured.out
 

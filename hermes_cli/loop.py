@@ -31,8 +31,10 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-MIN_INTERVAL_SECONDS = 60       # 1 minute minimum
-DEFAULT_INTERVAL_SECONDS = 300   # 5 minutes
+MIN_INTERVAL_SECONDS = 60            # 1 minute minimum
+MAX_INTERVAL_SECONDS = 86400 * 30    # 30 days maximum
+DEFAULT_INTERVAL_SECONDS = 300       # 5 minutes
+MAX_PROMPT_LENGTH = 2000             # characters, before truncation warning
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -129,6 +131,7 @@ def _ids_registry_key(session_id: str) -> str:
 
 
 _DB_CACHE: Dict[str, Any] = {}
+_DB_CACHE_LOCK = threading.Lock()
 
 
 def _get_session_db() -> Optional[Any]:
@@ -146,7 +149,9 @@ def _get_session_db() -> Optional[Any]:
         logger.debug("LoopManager: SessionDB bootstrap failed (%s)", exc)
         return None
 
-    cached = _DB_CACHE.get(home)
+    cached = None
+    with _DB_CACHE_LOCK:
+        cached = _DB_CACHE.get(home)
     if cached is not None:
         return cached
     try:
@@ -154,7 +159,8 @@ def _get_session_db() -> Optional[Any]:
     except Exception as exc:  # pragma: no cover
         logger.debug("LoopManager: SessionDB() raised (%s)", exc)
         return None
-    _DB_CACHE[home] = db
+    with _DB_CACHE_LOCK:
+        _DB_CACHE[home] = db
     return db
 
 
@@ -501,7 +507,22 @@ class LoopManager:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("loop prompt is empty")
-        effective_interval = max(int(interval_seconds), MIN_INTERVAL_SECONDS)
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            raise ValueError(
+                f"loop prompt is {len(prompt)} chars — max is {MAX_PROMPT_LENGTH}"
+            )
+        raw_seconds = int(interval_seconds)
+        if raw_seconds < MIN_INTERVAL_SECONDS:
+            logger.info(
+                "Loop interval %ds clamped to minimum %ds", raw_seconds, MIN_INTERVAL_SECONDS
+            )
+        elif raw_seconds > MAX_INTERVAL_SECONDS:
+            logger.info(
+                "Loop interval %ds capped to maximum %ds", raw_seconds, MAX_INTERVAL_SECONDS
+            )
+        effective_interval = max(
+            min(raw_seconds, MAX_INTERVAL_SECONDS), MIN_INTERVAL_SECONDS
+        )
         state = LoopState(
             id=_gen_uid(),
             prompt=prompt,
@@ -518,7 +539,7 @@ class LoopManager:
         if pending_input is not None and is_idle is not None:
             self._stop_scheduler()
             self._scheduler = LoopScheduler(
-                self.session_id, state,
+                self.session_id,
                 pending_input=pending_input,
                 is_idle=is_idle,
             )
@@ -534,7 +555,22 @@ class LoopManager:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("loop prompt is empty")
-        effective_interval = max(int(interval_seconds), MIN_INTERVAL_SECONDS)
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            raise ValueError(
+                f"loop prompt is {len(prompt)} chars — max is {MAX_PROMPT_LENGTH}"
+            )
+        raw_seconds = int(interval_seconds)
+        if raw_seconds < MIN_INTERVAL_SECONDS:
+            logger.info(
+                "Loop interval %ds clamped to minimum %ds", raw_seconds, MIN_INTERVAL_SECONDS
+            )
+        elif raw_seconds > MAX_INTERVAL_SECONDS:
+            logger.info(
+                "Loop interval %ds capped to maximum %ds", raw_seconds, MAX_INTERVAL_SECONDS
+            )
+        effective_interval = max(
+            min(raw_seconds, MAX_INTERVAL_SECONDS), MIN_INTERVAL_SECONDS
+        )
         state = LoopState(
             id=_gen_uid(),
             prompt=prompt,
@@ -560,7 +596,8 @@ class LoopManager:
                 return []
             s.status = "paused"
             _save_loop(self.session_id, s)
-            self._stop_scheduler()
+            if not self.is_active():
+                self._stop_scheduler()
             return [s]
 
         paused = []
@@ -569,7 +606,7 @@ class LoopManager:
                 s.status = "paused"
                 _save_loop(self.session_id, s)
                 paused.append(s)
-        if paused:
+        if paused and not self.is_active():
             self._stop_scheduler()
         return paused
 
@@ -586,7 +623,7 @@ class LoopManager:
             if s is None:
                 return []
             s.status = "active"
-            s.last_fired_at = 0.0  # fire immediately on next tick
+            s.last_fired_at = time.time()  # resume interval from now, not immediate
             _save_loop(self.session_id, s)
             self._restart_scheduler(pending_input, is_idle)
             return [s]
@@ -595,7 +632,7 @@ class LoopManager:
         for s in self._states.values():
             if s.status == "paused":
                 s.status = "active"
-                s.last_fired_at = 0.0
+                s.last_fired_at = time.time()  # resume interval from now, not immediate
                 _save_loop(self.session_id, s)
                 resumed.append(s)
         if resumed:
@@ -692,19 +729,20 @@ class LoopScheduler:
     """
 
     TICK_INTERVAL = 1.0
+    BURST_COOLDOWN_SECONDS = 2.0  # minimum gap between loop fires
 
-    def __init__(self, session_id: str, state: Optional[LoopState] = None, *,
+    def __init__(self, session_id: str, *,
                  pending_input: Any = None,
                  is_idle: Optional[Callable[[], bool]] = None,
-                 on_message: Optional[Callable[[str], None]] = None,
-                 dispatch: Optional[Callable[[str], bool]] = None):
+                 dispatch: Optional[Callable[[str], bool]] = None,
+                 max_turns: int = DEFAULT_MAX_TURNS):
         self._session_id = session_id
-        self._state = state
         self._pending_input = pending_input
         self._is_idle = is_idle
-        self._on_message = on_message  # accepted for API compat; not called
         self._dispatch = dispatch
+        self._max_turns = int(max_turns)
         self._running = False
+        self._last_dispatch_at: float = 0.0
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
@@ -746,6 +784,11 @@ class LoopScheduler:
             return
 
         now = time.time()
+
+        # Burst cooldown — prevent all overdue loops firing in one tick
+        if self._last_dispatch_at > 0 and (now - self._last_dispatch_at) < self.BURST_COOLDOWN_SECONDS:
+            return
+
         for state in states.values():
             if state.status != "active":
                 continue
@@ -753,16 +796,28 @@ class LoopScheduler:
                     and (now - state.last_fired_at) < state.interval_seconds):
                 continue
 
+            # Enforce max turns — auto-complete loops that have run enough
+            if state.turns_completed >= self._max_turns:
+                state.status = "done"
+                _save_loop(self._session_id, state)
+                logger.info(
+                    "Loop %s reached max turns (%d/%d) — marked done",
+                    state.id, state.turns_completed, self._max_turns,
+                )
+                continue
+
             if self._pending_input is not None:
                 self._pending_input.put(state.prompt)
                 state.last_fired_at = now
                 state.turns_completed += 1
                 _save_loop(self._session_id, state)
+                self._last_dispatch_at = now
             elif self._dispatch is not None:
                 if self._dispatch(state.prompt):
                     state.last_fired_at = now
                     state.turns_completed += 1
                     _save_loop(self._session_id, state)
+                    self._last_dispatch_at = now
 
 
 __all__ = [

@@ -82,8 +82,8 @@ class TestLoopCommandGateway:
         with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=[])):
             result = await runner._handle_loop_command(_make_event("/loop"))
 
-        assert "*/loop <schedule> <prompt>*" in result
-        assert "Subcommands:" in result
+        assert "/loop" in result
+        assert "Usage:" in result
         assert "No loop jobs" in result
 
     @pytest.mark.asyncio
@@ -98,9 +98,8 @@ class TestLoopCommandGateway:
         with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=jobs)):
             result = await runner._handle_loop_command(_make_event("/loop"))
 
-        assert "1 loop job(s)" in result
         assert "loop_abc123" in result
-        assert "▶" in result  # active icon
+        assert "\u25b6" in result  # active icon
 
     @pytest.mark.asyncio
     async def test_create_parses_schedule_and_prompt(self):
@@ -126,8 +125,8 @@ class TestLoopCommandGateway:
         assert calls[0]["prompt"] == "check deployment"
         assert calls[0]["name"].startswith("loop:")
         assert calls[0]["deliver"] == "origin"
-        assert "✅ Loop job created" in result
-        assert "`loop_abc123`" in result
+        assert "Loop job created" in result
+        assert "loop_abc123" in result
 
     @pytest.mark.asyncio
     async def test_create_empty_prompt_error(self):
@@ -153,7 +152,7 @@ class TestLoopCommandGateway:
         with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(jobs=jobs)):
             result = await runner._handle_loop_command(_make_event("/loop list"))
 
-        assert "*Loop Jobs:*" in result
+        assert "Loop Jobs:" in result
         assert "j1" in result
         assert "regular job" not in result
 
@@ -184,7 +183,7 @@ class TestLoopCommandGateway:
         assert calls[0]["action"] == "pause"
         assert calls[0]["job_id"] == "abc123"
         assert calls[0]["reason"] == "paused from /loop"
-        assert "⏸ Paused loop job" in result
+        assert "Paused loop job" in result
 
     @pytest.mark.asyncio
     async def test_pause_missing_id(self):
@@ -212,7 +211,7 @@ class TestLoopCommandGateway:
         assert len(calls) == 1
         assert calls[0]["action"] == "resume"
         assert calls[0]["job_id"] == "abc123"
-        assert "▶ Resumed loop job" in result
+        assert "Resumed loop job" in result
         assert "next run" in result.lower()
 
     @pytest.mark.asyncio
@@ -241,7 +240,7 @@ class TestLoopCommandGateway:
         assert len(calls) == 1
         assert calls[0]["action"] == "remove"
         assert calls[0]["job_id"] == "abc123"
-        assert "🗑 Removed loop job" in result
+        assert "Removed loop job" in result
 
     @pytest.mark.asyncio
     async def test_remove_missing_id(self):
@@ -261,7 +260,7 @@ class TestLoopCommandGateway:
         with patch("tools.cronjob_tools.cronjob", side_effect=_mock_cron_api(success=False, error="Invalid schedule")):
             result = await runner._handle_loop_command(_make_event("/loop 5m check deployment"))
 
-        assert "⚠ Failed to create loop" in result
+        assert "Failed to create loop" in result
         assert "Invalid schedule" in result
 
     @pytest.mark.asyncio

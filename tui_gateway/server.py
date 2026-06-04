@@ -891,6 +891,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         unregister_gateway_notify(key)
                     except Exception:
                         pass
+                mgr = current.get("_loop_manager")
+                if mgr is not None:
+                    try:
+                        mgr.shutdown()
+                    except Exception:
+                        pass
             ready.set()
 
     threading.Thread(target=_build, daemon=True).start()
@@ -912,8 +918,10 @@ def _make_tui_dispatch(session: dict, sid: str) -> Callable[[str], bool]:
             _run_prompt_submit(None, sid, session, prompt)
             return True
         except Exception:
+            logger.warning("Loop dispatch failed for session %s", sid, exc_info=True)
             with session["history_lock"]:
                 session["running"] = False
+            _emit("message.end", sid, {"error": "loop dispatch failed"})
             return False
     return _dispatch
 

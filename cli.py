@@ -8667,187 +8667,27 @@ class HermesCLI:
         print("  Available: list, add, edit, pause, resume, run, remove")
 
     def _handle_loop_command(self, cmd: str):
-        """Handle /loop <schedule> <prompt> — thin wrapper around cronjob tool.
-
-        Creates a recurring cron job from natural language input.
-        Subcommands: list, pause, resume, remove.
-        """
-        import json
-        import shlex
+        """Handle /loop <schedule> <prompt> — delegates to shared cron-based handler."""
         from tools.cronjob_tools import cronjob as cronjob_tool
-        from cron.jobs import get_job
+        from hermes_cli.loop_commands import handle_loop_command
 
-        def _cron_api(**kwargs):
-            return json.loads(cronjob_tool(**kwargs))
+        def _output(text: str) -> None:
+            _cprint(text)
 
-        tokens = shlex.split(cmd)
+        def _check_gateway() -> bool:
+            try:
+                from hermes_cli.cron import _is_gateway_running
+                return _is_gateway_running()
+            except Exception:
+                return True  # assume running if we can't check
 
-        # No args → show usage + list
-        if len(tokens) == 1:
-            _cprint("")
-            _cprint("+" + "-" * 68 + "+")
-            _cprint("|" + " " * 22 + "(^_^) /loop — Scheduled Prompts" + " " * 23 + "|")
-            _cprint("+" + "-" * 68 + "+")
-            _cprint("")
-            _cprint("  Usage:")
-            _cprint('    /loop <schedule> <prompt>     e.g. /loop 5m "check deployment"')
-            _cprint('    /loop list                    Show all loop jobs')
-            _cprint('    /loop pause <job_id>          Pause a loop job')
-            _cprint('    /loop resume <job_id>         Resume a paused loop job')
-            _cprint('    /loop remove <job_id>         Delete a loop job')
-            _cprint('    /loop clear                   Delete ALL loop jobs')
-            _cprint("")
-            _cprint("  Schedules:  5m, 30m, 2h, 1d, every 5m, every 2h, 0 9 * * *")
-            _cprint("")
-
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            if loop_jobs:
-                _cprint("  Loop Jobs:")
-                _cprint("  " + "-" * 63)
-                for job in loop_jobs:
-                    state = job.get("state", "?")
-                    state_icon = "▶" if state == "active" else "⏸"
-                    _cprint(f"    {state_icon} {job['job_id'][:12]:<12} | {job['schedule']:<15} | {job.get('repeat', 'forever')}")
-                    _cprint(f"      {job.get('prompt_preview', '')}")
-                    if job.get("next_run_at"):
-                        _cprint(f"      Next: {job['next_run_at']}")
-                    _cprint("")
-            else:
-                _cprint("  No loop jobs. Use '/loop <schedule> <prompt>' to create one.")
-            _cprint("")
-            return
-
-        subcommand = tokens[1].lower()
-
-        # /loop list
-        if subcommand == "list":
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            if not loop_jobs:
-                _cprint("(._.) No loop jobs found.")
-                return
-            _cprint("")
-            _cprint("Loop Jobs:")
-            _cprint("-" * 80)
-            for job in loop_jobs:
-                _cprint(f"  ID: {job['job_id']}")
-                _cprint(f"  Name: {job['name']}")
-                _cprint(f"  State: {job.get('state', '?')}")
-                _cprint(f"  Schedule: {job['schedule']} ({job.get('repeat', '?')})")
-                _cprint(f"  Next run: {job.get('next_run_at', 'N/A')}")
-                _cprint(f"  Prompt: {job.get('prompt_preview', '')}")
-                if job.get("last_run_at"):
-                    _cprint(f"  Last run: {job['last_run_at']} ({job.get('last_status', '?')})")
-                _cprint("")
-            return
-
-        # /loop pause <job_id>
-        if subcommand == "pause":
-            if len(tokens) < 3:
-                _cprint("(._.) Usage: /loop pause <job_id>")
-                return
-            job_id = tokens[2]
-            result = _cron_api(action="pause", job_id=job_id, reason="paused from /loop")
-            if result.get("success"):
-                _cprint(f"(^_^)b Paused loop job: {result['job']['name']} ({job_id})")
-            else:
-                _cprint(f"(x_x) Failed to pause: {result.get('error')}")
-            return
-
-        # /loop resume <job_id>
-        if subcommand == "resume":
-            if len(tokens) < 3:
-                _cprint("(._.) Usage: /loop resume <job_id>")
-                return
-            job_id = tokens[2]
-            result = _cron_api(action="resume", job_id=job_id)
-            if result.get("success"):
-                _cprint(f"(^_^)b Resumed loop job: {result['job']['name']} ({job_id})")
-                _cprint(f"  Next run: {result['job'].get('next_run_at')}")
-            else:
-                _cprint(f"(x_x) Failed to resume: {result.get('error')}")
-            return
-
-        # /loop remove <job_id>
-        if subcommand == "remove":
-            if len(tokens) < 3:
-                _cprint("(._.) Usage: /loop remove <job_id>")
-                return
-            job_id = tokens[2]
-            result = _cron_api(action="remove", job_id=job_id)
-            if result.get("success"):
-                _cprint(f"(^_^)b Removed loop job: {result.get('removed_job', {}).get('name', job_id)}")
-            else:
-                _cprint(f"(x_x) Failed to remove: {result.get('error')}")
-            return
-
-        # /loop clear — remove ALL loop jobs
-        if subcommand == "clear":
-            result = _cron_api(action="list", include_disabled=True)
-            jobs = result.get("jobs", []) if result.get("success") else []
-            loop_jobs = [j for j in jobs if j.get("name", "").startswith("loop:")]
-            if not loop_jobs:
-                _cprint("(._.) No loop jobs to clear.")
-                return
-            removed = 0
-            for j in loop_jobs:
-                r = _cron_api(action="remove", job_id=j["job_id"])
-                if r.get("success"):
-                    removed += 1
-            _cprint(f"(^_^)b Cleared {removed}/{len(loop_jobs)} loop job(s).")
-            return
-
-        # /loop <schedule> <prompt>  (create)
-        # Try to parse: first token is schedule, rest is prompt
-        # Handle "every 5m" syntax where "every" + next token form the schedule
-        if tokens[1].lower() == "every" and len(tokens) > 2:
-            schedule = f"every {tokens[2]}"
-            prompt = " ".join(tokens[3:]) if len(tokens) > 3 else ""
-        else:
-            schedule = tokens[1]
-            prompt = " ".join(tokens[2:]) if len(tokens) > 2 else ""
-
-        if not prompt:
-            _cprint("(._.) Usage: /loop <schedule> <prompt>")
-            _cprint('  Example: /loop 5m "check deployment status"')
-            _cprint('  Example: /loop every 30m "summarize news"')
-            return
-
-        # Warn if interval looks very short
-        from cron.jobs import parse_duration
-        try:
-            minutes = parse_duration(schedule.lstrip("every "))
-            if minutes < 1:
-                _cprint("⚠ Interval is very short (< 1 minute). The scheduler ticks every 60s, so this may not fire as expected.")
-        except Exception:
-            pass  # Not a simple duration — could be cron expr or "every X" form
-
-        # Check if gateway is running (best-effort)
-        try:
-            from hermes_cli.cron import _is_gateway_running
-            if not _is_gateway_running():
-                _cprint("⚠ No gateway is running. The job will be scheduled but will not execute until a gateway starts.")
-        except Exception:
-            pass
-
-        name = f"loop: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
-        result = _cron_api(
-            action="create",
-            schedule=schedule,
-            prompt=prompt,
-            name=name,
-            deliver="origin",
+        # Strip /loop prefix — handle_loop_command expects it there
+        handle_loop_command(
+            cmd,
+            cronjob_tool=cronjob_tool,
+            output=_output,
+            check_gateway_running=_check_gateway,
         )
-        if result.get("success"):
-            _cprint(f"(^_^)b Loop job created: {result['job_id']}")
-            _cprint(f"  Schedule: {result['schedule']}")
-            _cprint(f"  Next run: {result['next_run_at']}")
-            _cprint(f"  To stop: /loop remove {result['job_id']}")
-        else:
-            _cprint(f"(x_x) Failed to create loop: {result.get('error')}")
 
     def _handle_curator_command(self, cmd: str):
         """Handle /curator slash command.

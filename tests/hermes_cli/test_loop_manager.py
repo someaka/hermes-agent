@@ -242,7 +242,7 @@ class TestLoopScheduler:
         pq = queue.Queue()
         state = LoopState(prompt="test", interval_seconds=60)
         sched = LoopScheduler(
-            "sid-1", state,
+            "sid-1",
             pending_input=pq,
             is_idle=lambda: True,
         )
@@ -260,7 +260,7 @@ class TestLoopScheduler:
         pq = queue.Queue()
         state = LoopState(prompt="test", interval_seconds=60)
         sched = LoopScheduler(
-            "sid-2", state,
+            "sid-2",
             pending_input=pq,
             is_idle=lambda: True,
         )
@@ -281,7 +281,7 @@ class TestLoopScheduler:
         save_loop("sid-3", state)
 
         sched = LoopScheduler(
-            "sid-3", state,
+            "sid-3",
             pending_input=pq,
             is_idle=lambda: True,
         )
@@ -306,7 +306,7 @@ class TestLoopScheduler:
         save_loop("sid-4", state)
 
         sched = LoopScheduler(
-            "sid-4", state,
+            "sid-4",
             pending_input=pq,
             is_idle=lambda: False,  # agent is BUSY
         )
@@ -327,7 +327,7 @@ class TestLoopScheduler:
         save_loop("sid-5", state)
 
         sched = LoopScheduler(
-            "sid-5", state,
+            "sid-5",
             pending_input=pq,
             is_idle=lambda: True,
         )
@@ -346,7 +346,7 @@ class TestLoopScheduler:
         save_loop("sid-6", state)
 
         sched = LoopScheduler(
-            "sid-6", state,
+            "sid-6",
             pending_input=pq,
             is_idle=lambda: True,
         )
@@ -371,7 +371,7 @@ class TestLoopScheduler:
         save_loop("sid-7", state)
 
         sched = LoopScheduler(
-            "sid-7", state,
+            "sid-7",
             pending_input=pq,
             is_idle=lambda: True,
         )
@@ -380,7 +380,7 @@ class TestLoopScheduler:
         sched.stop()
 
     def test_on_message_callback(self, hermes_home):
-        """on_message was removed from _tick — verify no callback is called."""
+        """on_message parameter was removed — verify no TypeError."""
         from hermes_cli.loop import LoopScheduler, LoopState
 
         pq = queue.Queue()
@@ -391,15 +391,14 @@ class TestLoopScheduler:
         save_loop("sid-8", state)
 
         sched = LoopScheduler(
-            "sid-8", state,
+            "sid-8",
             pending_input=pq,
             is_idle=lambda: True,
-            on_message=lambda msg: messages.append(msg),
         )
         sched._tick()
         sched.stop()
 
-        # on_message callback was removed from _tick
+        # on_message parameter was removed entirely
         assert len(messages) == 0
 
     def test_scheduler_integrated_via_loop_manager(self, hermes_home):

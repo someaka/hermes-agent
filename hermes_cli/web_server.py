@@ -8949,7 +8949,7 @@ async def events_ws(ws: WebSocket) -> None:
                 subs.discard(ws)
 
                 if not subs:
-                    event_channels.pop(channel, None)
+                    _event_channels.pop(channel, None)
 
 
 def _normalise_prefix(raw: Optional[str]) -> str:

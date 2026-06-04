@@ -352,6 +352,21 @@ def get_active_memory_providers() -> List[str]:
     return []
 
 
+def _get_active_memory_provider() -> Optional[str]:
+    """Read the active memory provider name from config.yaml.
+
+    Returns the provider name (e.g. ``"honcho"``) or None if no
+    external provider is configured.  Lightweight — only reads config,
+    no plugin loading.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        return cfg_get(config, "memory", "provider") or None
+    except Exception:
+        return None
+
+
 def discover_plugin_cli_commands() -> List[dict]:
     """Return CLI commands for **active** memory plugins.
 

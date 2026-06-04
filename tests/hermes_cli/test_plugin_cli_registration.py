@@ -95,7 +95,7 @@ class TestMemoryPluginCliDiscovery:
 
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
         # Set testplugin as the active provider
-        monkeypatch.setattr(pm, "get_active_memory_providers", lambda: ["testplugin"])
+        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: "testplugin")
         try:
             cmds = pm.discover_plugin_cli_commands()
         finally:
@@ -121,7 +121,7 @@ class TestMemoryPluginCliDiscovery:
         import plugins.memory as pm
         original_dir = pm._MEMORY_PLUGINS_DIR
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
-        monkeypatch.setattr(pm, "get_active_memory_providers", lambda: [])
+        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: None)
         try:
             cmds = pm.discover_plugin_cli_commands()
         finally:
@@ -139,7 +139,7 @@ class TestMemoryPluginCliDiscovery:
         import plugins.memory as pm
         original_dir = pm._MEMORY_PLUGINS_DIR
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
-        monkeypatch.setattr(pm, "get_active_memory_providers", lambda: ["noplugin"])
+        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: "noplugin")
         try:
             cmds = pm.discover_plugin_cli_commands()
         finally:
@@ -157,7 +157,7 @@ class TestMemoryPluginCliDiscovery:
         import plugins.memory as pm
         original_dir = pm._MEMORY_PLUGINS_DIR
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
-        monkeypatch.setattr(pm, "get_active_memory_providers", lambda: ["nocli"])
+        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: "nocli")
         try:
             cmds = pm.discover_plugin_cli_commands()
         finally:
@@ -187,7 +187,7 @@ class TestMemoryPluginCliDiscovery:
 
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
         monkeypatch.setattr(
-            pm, "get_active_memory_providers", lambda: ["plugin1", "plugin2"]
+            pm, "_get_active_memory_provider", lambda: "plugin1"
         )
         try:
             cmds = pm.discover_plugin_cli_commands()
@@ -196,10 +196,9 @@ class TestMemoryPluginCliDiscovery:
             for pname in ("plugin1", "plugin2"):
                 sys.modules.pop(f"plugins.memory.{pname}.cli", None)
 
-        assert len(cmds) == 2
+        assert len(cmds) == 1
         names = {c["name"] for c in cmds}
         assert "plugin1" in names
-        assert "plugin2" in names
         for cmd in cmds:
             assert callable(cmd["setup_fn"])
             assert callable(cmd["handler_fn"])

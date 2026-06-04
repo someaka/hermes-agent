@@ -328,6 +328,30 @@ def get_active_memory_providers() -> list:
         return []
 
 
+def get_active_memory_providers() -> List[str]:
+    """Return the list of active memory provider names from config.
+
+    Reads ``memory.providers`` (list) first, then falls back to
+    ``memory.provider`` (legacy single string).  Returns an empty
+    list if no provider is configured.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except Exception:
+        return []
+
+    memory_cfg = config.get("memory", {}) if isinstance(config, dict) else {}
+    providers = memory_cfg.get("providers")
+    if providers and isinstance(providers, list):
+        return [p for p in providers if p]
+    # Legacy single-provider fallback
+    single = memory_cfg.get("provider")
+    if single:
+        return [single]
+    return []
+
+
 def discover_plugin_cli_commands() -> List[dict]:
     """Return CLI commands for **active** memory plugins.
 

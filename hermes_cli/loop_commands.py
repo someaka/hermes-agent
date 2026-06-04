@@ -19,6 +19,74 @@ def _cron_api(cronjob_tool, **kwargs) -> dict:
     return json.loads(cronjob_tool(**kwargs))
 
 
+from hermes_cli.loop import (
+    MIN_INTERVAL_SECONDS,
+    _parse_interval,
+)
+
+
+def parse_loop_command(text: str) -> dict:
+    """Parse a /loop command into a structured action dict.
+
+    Returns dict with keys::
+
+        action: "list" | "pause" | "pause_all" | "resume" | "resume_all"
+                | "delete" | "delete_all" | "create" | "error"
+        uid:    target UID (for pause/resume/delete)
+        interval_seconds: int (for create)
+        prompt: str (for create)
+        message: str (for error)
+    """
+    # Strip /loop prefix
+    text = text.strip()
+    if text.startswith("/"):
+        text = text.lstrip("/")
+    if text.lower().startswith("loop"):
+        text = text[4:].strip()
+
+    # Strip leading "every " prefix (common user input)
+    if text.lower().startswith("every "):
+        text = text[6:].strip()
+
+    if not text:
+        return {"action": "list"}
+
+    tokens = text.split()
+    first = tokens[0].lower()
+
+    if first in ("list", "status"):
+        return {"action": "list"}
+
+    if first == "pause":
+        if len(tokens) > 1:
+            return {"action": "pause", "uid": tokens[1].lstrip("#")}
+        return {"action": "pause_all"}
+
+    if first == "resume":
+        if len(tokens) > 1:
+            return {"action": "resume", "uid": tokens[1].lstrip("#")}
+        return {"action": "resume_all"}
+
+    if first in ("remove", "delete", "rm", "clear", "stop", "done"):
+        if len(tokens) > 1:
+            return {"action": "delete", "uid": tokens[1].lstrip("#")}
+        return {"action": "delete_all"}
+
+    # /loop <interval> <prompt> — create
+    interval = _parse_interval(tokens[0])
+    if interval is not None and len(tokens) > 1:
+        interval = max(interval, MIN_INTERVAL_SECONDS)
+        prompt = " ".join(tokens[1:])
+        return {"action": "create", "interval_seconds": interval, "prompt": prompt}
+    if interval is not None:
+        return {
+            "action": "error",
+            "message": f"Missing prompt. Usage: /loop {tokens[0]} <prompt>",
+        }
+
+    return {"action": "error", "message": f"Unknown subcommand: {first!r}"}
+
+
 def handle_loop_command(
     text: str,
     *,

@@ -11,6 +11,13 @@ def _load_optional_dependencies():
     return project["optional-dependencies"]
 
 
+def _load_package_data():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        tool = tomllib.load(handle)["tool"]
+    return tool["setuptools"]["package-data"]
+
+
 def test_matrix_extra_linux_only_in_all():
     """mautrix[encryption] depends on python-olm which is upstream-broken on
     modern macOS (archived libolm, C++ errors with Clang 21+) and has no

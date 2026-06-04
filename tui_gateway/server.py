@@ -124,6 +124,7 @@ _answers: dict[str, str] = {}
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
+_session_resume_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.Lock()
 _prompt_lock = threading.Lock()
@@ -3121,6 +3122,15 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+    for sid, session in list(_sessions.items()):
+        if session.get("_finalized"):
+            continue
+        if str(session.get("session_key") or "") == session_key:
+            return sid, session
+    return None
+
+
 def _inflight_snapshot(session: dict) -> dict | None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
@@ -3325,6 +3335,10 @@ def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
+    try:
+        cols = int(params.get("cols", 80))
+    except (TypeError, ValueError):
+        cols = 80
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5000)
@@ -3335,6 +3349,25 @@ def _(rid, params: dict) -> dict:
             target = found["id"]
         else:
             return _err(rid, 4007, "session not found")
+    # Fast path: if the session is already live, reuse it under the lock.
+    with _session_resume_lock:
+        live = _find_live_session_by_key(target)
+        if live is not None:
+            sid, session = live
+            payload = _live_session_payload(
+                sid,
+                session,
+                cols=cols,
+                touch=True,
+                transport=current_transport() or _stdio_transport,
+            )
+            payload["resumed"] = target
+            return _ok(rid, payload)
+
+    # Build the agent OUTSIDE the lock — _make_agent can block for seconds
+    # (MCP discovery, prompt/skill build, AIAgent construction). Holding
+    # _session_resume_lock across it would stall session.close on the main
+    # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
     sid = uuid.uuid4().hex[:8]
     _enable_gateway_prompts()
     try:
@@ -3343,15 +3376,46 @@ def _(rid, params: dict) -> dict:
         display_history = db.get_messages_as_conversation(
             target, include_ancestors=True
         )
+        display_history_prefix = display_history[
+            : max(0, len(display_history) - len(history))
+        ]
         messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
         try:
             agent = _make_agent(sid, target, session_id=target)
         finally:
             _clear_session_context(tokens)
-        _init_session(sid, target, agent, history, cols=int(params.get("cols", 80)))
     except Exception as e:
         return _err(rid, 5000, f"resume failed: {e}")
+
+    # Double-checked locking: another concurrent resume may have created the
+    # live session while we were building. Re-check under the lock; if it won,
+    # discard our just-built agent and reuse theirs (no worker/poller wired yet).
+    with _session_resume_lock:
+        live = _find_live_session_by_key(target)
+        if live is not None:
+            try:
+                if hasattr(agent, "close"):
+                    agent.close()
+            except Exception:
+                pass
+            other_sid, other_session = live
+            payload = _live_session_payload(
+                other_sid,
+                other_session,
+                cols=cols,
+                touch=True,
+                transport=current_transport() or _stdio_transport,
+            )
+            payload["resumed"] = target
+            return _ok(rid, payload)
+        try:
+            _init_session(sid, target, agent, history, cols=cols)
+            if sid in _sessions:
+                _sessions[sid]["display_history_prefix"] = display_history_prefix
+        except Exception as e:
+            return _err(rid, 5000, f"resume failed: {e}")
+        session = _sessions.get(sid) or {}
     return _ok(
         rid,
         {
@@ -3359,7 +3423,12 @@ def _(rid, params: dict) -> dict:
             "resumed": target,
             "message_count": len(messages),
             "messages": messages,
-            "info": _session_info(agent, _sessions.get(sid)),
+            "info": _session_info(agent, session),
+            "inflight": None,
+            "running": False,
+            "session_key": target,
+            "started_at": float(session.get("created_at") or time.time()),
+            "status": "idle",
         },
     )
 
@@ -3450,6 +3519,41 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         "status": status,
         "title": _session_live_title(session, key),
     }
+
+
+def _live_session_payload(
+    sid: str,
+    session: dict,
+    *,
+    cols: int | None = None,
+    touch: bool = False,
+    transport: Transport | None = None,
+) -> dict:
+    with session["history_lock"]:
+        if cols is not None:
+            session["cols"] = cols
+        if transport is not None:
+            session["transport"] = transport
+        if touch:
+            session["last_active"] = time.time()
+        history = list(session.get("display_history_prefix") or []) + list(
+            session.get("history") or []
+        )
+        inflight = _inflight_snapshot(session)
+        running = bool(session.get("running"))
+    payload = {
+        "info": _fallback_session_info(session),
+        "message_count": len(history),
+        "messages": _history_to_messages(history),
+        "running": running,
+        "session_id": sid,
+        "session_key": session.get("session_key") or sid,
+        "started_at": float(session.get("created_at") or time.time()),
+        "status": _session_live_status(sid, session),
+    }
+    if inflight:
+        payload["inflight"] = inflight
+    return payload
 
 
 def _fallback_session_info(session: dict) -> dict:

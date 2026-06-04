@@ -31,6 +31,7 @@ from typing import List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
+_USER_NAMESPACE = "_hermes_user_memory"
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,24 @@ def _get_user_plugins_dir() -> Optional[Path]:
         return d if d.is_dir() else None
     except Exception:
         return None
+
+
+def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
+    """Register an empty package shell in sys.modules.
+
+    User-installed providers import as ``_hermes_user_memory.<name>``, a
+    dotted name whose parents exist nowhere on disk.  Unless those parents
+    are present in ``sys.modules``, any relative import inside the plugin
+    (``from . import config``) fails with
+    ``ModuleNotFoundError: No module named '_hermes_user_memory'`` — the
+    same reason the loader already registers ``plugins`` and
+    ``plugins.memory`` for bundled providers.
+    """
+    if name in sys.modules:
+        return
+    spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
+    spec.submodule_search_locations = search_locations
+    sys.modules[name] = importlib.util.module_from_spec(spec)
 
 
 def _is_memory_provider_dir(path: Path) -> bool:
@@ -224,6 +243,12 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                             pass
 
         # Now load the provider module
+
+        # User-installed plugins need their synthetic parent registered the
+        # same way, or relative imports inside the plugin cannot resolve.
+        if not _is_bundled:
+            _register_synthetic_package(_USER_NAMESPACE, [])
+
         spec = importlib.util.spec_from_file_location(
             module_name, str(init_file),
             submodule_search_locations=[str(provider_dir)]

@@ -4169,6 +4169,11 @@ class GatewayRunner:
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
 
+            # Already being resumed (e.g. scheduled at startup and still
+            # in-flight) — don't synthesize a second continuation turn.
+            if entry.session_key in self._running_agents:
+                continue
+
             source = entry.origin
             adapter = self.adapters.get(source.platform)
             if adapter is None:

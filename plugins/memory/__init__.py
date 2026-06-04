@@ -440,6 +440,18 @@ def discover_plugin_cli_commands() -> List[dict]:
             if module_name in sys.modules:
                 cli_mod = sys.modules[module_name]
             else:
+                if not _is_bundled:
+                    # cli.py imports as _hermes_user_memory.<name>.cli, usually
+                    # before the provider itself is loaded.  Register its parent
+                    # packages so relative imports inside cli.py
+                    # ("from . import config") resolve without executing the
+                    # plugin's __init__.py.  The package shell has no __file__,
+                    # so _load_provider_from_dir() will still load the real
+                    # module later instead of reusing the shell.
+                    _register_synthetic_package(_USER_NAMESPACE, [])
+                    _register_synthetic_package(
+                        f"{_USER_NAMESPACE}.{active_provider}", [str(plugin_dir)]
+                    )
                 spec = importlib.util.spec_from_file_location(
                     module_name, str(cli_file)
                 )

@@ -217,9 +217,12 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
     if not init_file.exists():
         return None
 
-    # Check if already loaded
-    if module_name in sys.modules:
-        mod = sys.modules[module_name]
+    # Check if already loaded.  A synthetic package shell registered by
+    # discover_plugin_cli_commands() for relative-import support has no
+    # __file__; only reuse modules that were actually loaded from disk.
+    cached = sys.modules.get(module_name)
+    if cached is not None and getattr(cached, "__file__", None):
+        mod = cached
     else:
         # Handle relative imports within the plugin
         # First ensure the parent packages are registered

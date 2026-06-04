@@ -414,6 +414,12 @@ def discover_plugin_cli_commands() -> List[dict]:
         return results
 
     active_providers = get_active_memory_providers()
+    # Fallback: if the multi-provider list is empty, try the legacy
+    # single-provider config key set by `memory.provider` in config.yaml.
+    if not active_providers:
+        single = _get_active_memory_provider()
+        if single:
+            active_providers = [single]
     if not active_providers:
         return results
 

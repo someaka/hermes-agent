@@ -375,7 +375,6 @@ select = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
 
 [tool.uv]
-exclude-newer = "7 days"
 
 [dependency-groups]
 dev = [

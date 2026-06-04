@@ -31,10 +31,8 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
-MIN_INTERVAL_SECONDS = 60            # 1 minute minimum
-MAX_INTERVAL_SECONDS = 86400 * 30    # 30 days maximum
-DEFAULT_INTERVAL_SECONDS = 300       # 5 minutes
-MAX_PROMPT_LENGTH = 2000             # characters, before truncation warning
+MIN_INTERVAL_SECONDS = 60       # 1 minute minimum
+DEFAULT_INTERVAL_SECONDS = 300   # 5 minutes
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -507,22 +505,12 @@ class LoopManager:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("loop prompt is empty")
-        if len(prompt) > MAX_PROMPT_LENGTH:
-            raise ValueError(
-                f"loop prompt is {len(prompt)} chars — max is {MAX_PROMPT_LENGTH}"
-            )
         raw_seconds = int(interval_seconds)
         if raw_seconds < MIN_INTERVAL_SECONDS:
             logger.info(
                 "Loop interval %ds clamped to minimum %ds", raw_seconds, MIN_INTERVAL_SECONDS
             )
-        elif raw_seconds > MAX_INTERVAL_SECONDS:
-            logger.info(
-                "Loop interval %ds capped to maximum %ds", raw_seconds, MAX_INTERVAL_SECONDS
-            )
-        effective_interval = max(
-            min(raw_seconds, MAX_INTERVAL_SECONDS), MIN_INTERVAL_SECONDS
-        )
+        effective_interval = max(raw_seconds, MIN_INTERVAL_SECONDS)
         state = LoopState(
             id=_gen_uid(),
             prompt=prompt,
@@ -555,22 +543,12 @@ class LoopManager:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("loop prompt is empty")
-        if len(prompt) > MAX_PROMPT_LENGTH:
-            raise ValueError(
-                f"loop prompt is {len(prompt)} chars — max is {MAX_PROMPT_LENGTH}"
-            )
         raw_seconds = int(interval_seconds)
         if raw_seconds < MIN_INTERVAL_SECONDS:
             logger.info(
                 "Loop interval %ds clamped to minimum %ds", raw_seconds, MIN_INTERVAL_SECONDS
             )
-        elif raw_seconds > MAX_INTERVAL_SECONDS:
-            logger.info(
-                "Loop interval %ds capped to maximum %ds", raw_seconds, MAX_INTERVAL_SECONDS
-            )
-        effective_interval = max(
-            min(raw_seconds, MAX_INTERVAL_SECONDS), MIN_INTERVAL_SECONDS
-        )
+        effective_interval = max(raw_seconds, MIN_INTERVAL_SECONDS)
         state = LoopState(
             id=_gen_uid(),
             prompt=prompt,
@@ -734,13 +712,11 @@ class LoopScheduler:
     def __init__(self, session_id: str, *,
                  pending_input: Any = None,
                  is_idle: Optional[Callable[[], bool]] = None,
-                 dispatch: Optional[Callable[[str], bool]] = None,
-                 max_turns: int = DEFAULT_MAX_TURNS):
+                 dispatch: Optional[Callable[[str], bool]] = None):
         self._session_id = session_id
         self._pending_input = pending_input
         self._is_idle = is_idle
         self._dispatch = dispatch
-        self._max_turns = int(max_turns)
         self._running = False
         self._last_dispatch_at: float = 0.0
         self._thread: Optional[threading.Thread] = None
@@ -794,16 +770,6 @@ class LoopScheduler:
                 continue
             if (state.last_fired_at > 0
                     and (now - state.last_fired_at) < state.interval_seconds):
-                continue
-
-            # Enforce max turns — auto-complete loops that have run enough
-            if state.turns_completed >= self._max_turns:
-                state.status = "done"
-                _save_loop(self._session_id, state)
-                logger.info(
-                    "Loop %s reached max turns (%d/%d) — marked done",
-                    state.id, state.turns_completed, self._max_turns,
-                )
                 continue
 
             if self._pending_input is not None:

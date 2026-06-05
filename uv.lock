@@ -1643,7 +1643,6 @@ requires-dist = [
     { name = "hermes-agent", extras = ["cli"], marker = "extra == 'termux'" },
     { name = "hermes-agent", extras = ["cron"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["cron"], marker = "extra == 'termux'" },
-    { name = "hermes-agent", extras = ["dev"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["dingtalk"], marker = "extra == 'termux-all'" },
     { name = "hermes-agent", extras = ["feishu"], marker = "extra == 'termux-all'" },
     { name = "hermes-agent", extras = ["google"], marker = "extra == 'all'" },

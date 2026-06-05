@@ -5471,6 +5471,8 @@ def test_notification_poller_skips_consumed(monkeypatch):
 
 def test_notification_poller_requeues_when_busy(monkeypatch):
     """When the agent is busy, the callback queues the event as pending."""
+    from tools.process_registry import process_registry
+
     emitted = []
 
     sess = _session(running=True)  # agent is busy

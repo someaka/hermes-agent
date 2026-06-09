@@ -11828,7 +11828,7 @@ class HermesCLI:
         self._clarify_freetext = is_open_ended
 
         # Trigger prompt_toolkit repaint from this (non-main) thread
-        self._invalidate()
+        self._paint_now()
 
         # Poll for the user's response.  The countdown in the hint line
         # updates on each invalidate — but frequent repaints cause visible
@@ -11888,7 +11888,7 @@ class HermesCLI:
         }
         self._sudo_deadline = _time.monotonic() + timeout
 
-        self._invalidate()
+        self._paint_now()
 
         while True:
             try:
@@ -11896,7 +11896,7 @@ class HermesCLI:
                 self._sudo_state = None
                 self._sudo_deadline = 0
                 self._restore_modal_input_snapshot()
-                self._invalidate()
+                self._paint_now()
                 if result:
                     _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
                 else:
@@ -11911,7 +11911,7 @@ class HermesCLI:
         self._sudo_state = None
         self._sudo_deadline = 0
         self._restore_modal_input_snapshot()
-        self._invalidate()
+        self._paint_now()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
 
@@ -12224,7 +12224,7 @@ class HermesCLI:
         self._secret_state["response_queue"].put(value)
         self._secret_state = None
         self._secret_deadline = 0
-        self._invalidate()
+        self._paint_now()
 
     def _cancel_secret_capture(self) -> None:
         self._submit_secret_response("")

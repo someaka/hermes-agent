@@ -738,13 +738,30 @@ def _collect_auto_append_media_tags(
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
         if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
+        tool_name = tool_name_by_call_id.get(call_id, "")
         content = str(msg.get("content") or "")
-        if "MEDIA:" not in content:
-            continue
-        for match in _TOOL_MEDIA_RE.finditer(content):
-            path = match.group(1).strip().rstrip('\",}')
-            if path and path not in history_media_paths:
-                media_tags.append(f"MEDIA:{path}")
+
+        # JSON-path extraction for image_generate results
+        if tool_name == "image_generate":
+            try:
+                import json as _json
+                result = _json.loads(content)
+            except Exception:
+                result = {}
+            if isinstance(result, dict) and result.get("success"):
+                for key in ("host_image", "image", "agent_visible_image"):
+                    path = result.get(key)
+                    if isinstance(path, str) and path.startswith("/") and path not in history_media_paths:
+                        media_tags.append(f"MEDIA:{path}")
+                        history_media_paths.add(path)
+                        break
+
+        # MEDIA: tag extraction for TTS
+        if "MEDIA:" in content:
+            for match in _TOOL_MEDIA_RE.finditer(content):
+                path = match.group(1).strip().rstrip('\\",}')
+                if path and path not in history_media_paths:
+                    media_tags.append(f"MEDIA:{path}")
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 

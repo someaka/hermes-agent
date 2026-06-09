@@ -779,9 +779,17 @@ def render_notice_line(notice) -> str:
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
 # ---------------------------------------------------------------------------
 def _ensure_ssl_certs() -> None:
-    """Set SSL_CERT_FILE if the system doesn't expose CA certs to Python."""
-    if "SSL_CERT_FILE" in os.environ:
-        return  # user already configured it
+    """Set SSL_CERT_FILE if the system doesn't expose CA certs to Python.
+
+    A stale SSL_CERT_FILE pointing to a missing file causes every HTTP client
+    to fail. Treat a missing path as unset and fall back.
+    """
+    configured = os.environ.get("SSL_CERT_FILE")
+    if configured:
+        if os.path.exists(configured):
+            return
+        # Stale path — remove and fall through to auto-detect
+        os.environ.pop("SSL_CERT_FILE", None)
 
     import ssl
 
@@ -1241,11 +1249,31 @@ def _resolve_max_tokens_from_config() -> int | None:
                 return v
         except ValueError:
             pass
-    from hermes_cli.config import load_config
-    cfg = load_config()
-    m = cfg.get("model", {})
+    # Read raw YAML to preserve keys like max_output_tokens that
+    # load_config() strips during validation.
+    try:
+        import yaml as _y
+        cfg_path = _hermes_home / "config.yaml"
+        if cfg_path.exists():
+            with open(cfg_path, encoding="utf-8") as _f:
+                raw = _y.safe_load(_f) or {}
+        else:
+            raw = {}
+    except Exception:
+        raw = {}
+    m = raw.get("model", {})
     if isinstance(m.get("max_tokens"), int) and m["max_tokens"] > 0:
         return m["max_tokens"]
+    provider_name = m.get("provider", "")
+    if provider_name:
+        for section in ("providers", "custom_providers"):
+            providers = raw.get(section, {})
+            if provider_name in providers:
+                entry = providers[provider_name]
+                for key in ("max_output_tokens", "max_tokens"):
+                    val = entry.get(key)
+                    if isinstance(val, int) and val > 0:
+                        return val
     return None
 
 

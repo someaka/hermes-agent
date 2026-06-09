@@ -3534,6 +3534,25 @@ class HermesCLI:
         if hasattr(self, "_app") and self._app:
             self._app.invalidate()
 
+    def _claim_active_session(self, session_key: str) -> bool:
+        try:
+            limit = getattr(self, "_active_session_limit", 0)
+            if limit and len(getattr(self, "_active_sessions", {})) >= limit:
+                return False
+            if not hasattr(self, "_active_sessions"):
+                self._active_sessions = {}
+            self._active_sessions[session_key] = True
+            return True
+        except Exception:
+            return True
+
+    def _release_active_session(self, session_key: str) -> None:
+        try:
+            if hasattr(self, "_active_sessions"):
+                self._active_sessions.pop(session_key, None)
+        except Exception:
+            pass
+
     def _force_full_redraw(self) -> None:
         """Force a clean full-screen repaint of the prompt_toolkit UI.
 

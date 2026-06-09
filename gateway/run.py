@@ -14059,6 +14059,10 @@ class GatewayRunner:
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
+    async def _handle_version_command(self, event) -> str:
+        from hermes_cli.banner import format_banner_version_label
+        return format_banner_version_label()
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 

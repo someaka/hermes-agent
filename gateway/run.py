@@ -8664,7 +8664,7 @@ class GatewayRunner:
                     )
 
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
+                message_text, _voice_transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
                 )
@@ -15717,13 +15717,13 @@ class GatewayRunner:
             if user_text:
                 return f"{prefix}\n\n{user_text}"
             return prefix
-        return user_text
+        return (user_text, [])
 
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
         audio_paths: List[str],
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
@@ -15747,7 +15747,7 @@ class GatewayRunner:
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
             if not notes:
-                return user_text
+                return (user_text, [])
             prefix = "\n\n".join(notes)
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
@@ -15759,12 +15759,14 @@ class GatewayRunner:
         from tools.transcription_tools import transcribe_audio
 
         enriched_parts = []
+        transcripts = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    transcripts.append(transcript)
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
@@ -15810,8 +15812,8 @@ class GatewayRunner:
                 return prefix
             if user_text:
                 return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+            return (prefix, transcripts)
+        return (user_text, transcripts)
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.

@@ -11964,7 +11964,7 @@ class HermesCLI:
             }
             self._approval_deadline = _time.monotonic() + timeout
 
-            self._invalidate()
+            self._paint_now()
 
             _last_countdown_refresh = _time.monotonic()
             while True:
@@ -11972,7 +11972,7 @@ class HermesCLI:
                     result = response_queue.get(timeout=1)
                     self._approval_state = None
                     self._approval_deadline = 0
-                    self._invalidate()
+                    self._paint_now()
                     return result
                 except queue.Empty:
                     remaining = self._approval_deadline - _time.monotonic()
@@ -11985,7 +11985,7 @@ class HermesCLI:
 
             self._approval_state = None
             self._approval_deadline = 0
-            self._invalidate()
+            self._paint_now()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
 

@@ -4,14 +4,17 @@ more external plugin memory providers.
 Single integration point in run_agent.py. Replaces scattered per-backend
 code with one manager that delegates to registered providers.
 
-Only ONE external plugin provider is allowed at a time — attempting to
-register a second external provider is rejected with a warning.  This
-prevents tool schema bloat and conflicting memory backends.
+The BuiltinMemoryProvider is always registered first and cannot be removed.
+Multiple external providers can be active simultaneously via the
+``memory.providers`` list in config.yaml.  Results are merged across
+all active providers at runtime.
 
 Usage in run_agent.py:
     self._memory_manager = MemoryManager()
-    # Only ONE of these:
-    self._memory_manager.add_provider(plugin_provider)
+    self._memory_manager.add_provider(BuiltinMemoryProvider(...))
+    # One or more external providers:
+    for provider in external_providers:
+        self._memory_manager.add_provider(provider)
 
     # System prompt
     prompt_parts.append(self._memory_manager.build_system_prompt())
@@ -39,9 +42,7 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 # How long shutdown_all() waits for in-flight background sync/prefetch work
-# to drain before abandoning it. A wedged provider must never block process
-# teardown indefinitely — the worker threads are daemon, so anything still
-# running past this window dies with the interpreter.
+# to drain before abandoning it.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 
 
@@ -253,18 +254,17 @@ def build_memory_context_block(raw_context: str) -> str:
 class MemoryManager:
     """Orchestrates the built-in provider plus one or more external providers.
 
-    The builtin provider is always first. Multiple external (non-builtin) 
-    providers can be registered. Duplicate names are rejected with a warning.
+    The builtin provider is always first. Only one non-builtin (external)
+    provider is allowed at a time; attempts to register a second external
+    provider are rejected with a warning. Duplicate names are also rejected.
     Failures in one provider never block the others.
-
-    Thread-safe: protected by ``self._lock``.
     """
 
     def __init__(self) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
-        self._lock = threading.RLock()
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._lock = threading.RLock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -296,8 +296,6 @@ class MemoryManager:
                     )
                     return
 
-                self._has_external = True
-
             # Collect tool schemas BEFORE mutating state — if schema loading
             # fails the provider must NOT be registered (fixes #9948).
             try:
@@ -309,51 +307,46 @@ class MemoryManager:
                 )
                 return
 
+            if not is_builtin:
+                self._has_external = True
+
             self._providers.append(provider)
 
-        # Core tool names are reserved — a memory provider must never register
-        # a tool that shadows a built-in (e.g. ``clarify``, ``delegate_task``).
-        # Built-ins always win, so such a tool is dropped at agent init and
-        # would otherwise linger in ``_tool_to_provider`` and hijack dispatch
-        # (#40466). Reject it here, at the door, so it never enters the routing
-        # table at all — matching the built-ins-always-win invariant used by
-        # the TTS/browser/search provider registries.
-        from toolsets import _HERMES_CORE_TOOLS
+            # Index tool names → provider for routing
+            for schema in schemas:
+                tool_name = schema.get("name", "")
+                if tool_name and tool_name not in self._tool_to_provider:
+                    self._tool_to_provider[tool_name] = provider
+                elif tool_name in self._tool_to_provider:
+                    logger.warning(
+                        "Memory tool name conflict: '%s' already registered by %s, "
+                        "ignoring from %s",
+                        tool_name,
+                        self._tool_to_provider[tool_name].name,
+                        provider.name,
+                    )
 
-        _core_tool_names = set(_HERMES_CORE_TOOLS)
+            # Namespace validation — warn if tool names don't follow convention
+            for schema in schemas:
+                tool_name = schema.get("name", "")
+                if provider.name != "builtin" and not tool_name.startswith(provider.name[:4]):
+                    logger.warning(
+                        "Provider '%s' tool '%s' does not follow naming convention '<provider>_<action>'.",
+                        provider.name, tool_name,
+                    )
 
-        # Index tool names → provider for routing
-        for schema in provider.get_tool_schemas():
-            tool_name = schema.get("name", "")
-            if tool_name in _core_tool_names:
-                logger.warning(
-                    "Memory provider '%s' tool '%s' shadows a reserved core "
-                    "tool name; registration ignored. Core tools always win — "
-                    "rename the provider's tool to something unique.",
-                    provider.name, tool_name,
-                )
-                continue
-            if tool_name and tool_name not in self._tool_to_provider:
-                self._tool_to_provider[tool_name] = provider
-            elif tool_name in self._tool_to_provider:
-                logger.warning(
-                    "Memory tool name conflict: '%s' already registered by %s, "
-                    "ignoring from %s",
-                    tool_name,
-                    self._tool_to_provider[tool_name].name,
-                    provider.name,
-                )
-
-        logger.info(
-            "Memory provider '%s' registered (%d tools)",
-            provider.name,
-            len(provider.get_tool_schemas()),
-        )
+            ext_count = sum(1 for p in self._providers if p.name != "builtin")
+            total_tools = len(self._tool_to_provider)
+            logger.info(
+                "Memory provider '%s' registered (%d tools). Active: %d external, %d total tools.",
+                provider.name, len(schemas), ext_count, total_tools,
+            )
 
     @property
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
-        return list(self._providers)
+        with self._lock:
+            return list(self._providers)
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""
@@ -367,18 +360,67 @@ class MemoryManager:
         if name == "builtin":
             logger.warning("Cannot remove builtin memory provider")
             return False
+
+        with self._lock:
+            for i, p in enumerate(self._providers):
+                if p.name == name:
+                    # Remove tool mappings
+                    tools_to_remove = [t for t, prov in self._tool_to_provider.items() if prov is p]
+                    for t in tools_to_remove:
+                        del self._tool_to_provider[t]
+
+                    # Shutdown the provider
+                    try:
+                        p.shutdown()
+                    except Exception as exc:
+                        logger.warning("Provider '%s' shutdown failed: %s", name, exc)
+
+                    self._providers.pop(i)
+                    logger.info("Memory provider '%s' removed (had %d tools)", name, len(tools_to_remove))
+                    return True
+
+            logger.warning("Provider '%s' not found for removal", name)
+            return False
+
+    @property
+    def providers(self) -> List[MemoryProvider]:
+        """All registered providers in order."""
+        with self._lock:
+            return list(self._providers)
+
+    def get_provider(self, name: str) -> Optional[MemoryProvider]:
+        """Get a provider by name, or None if not registered."""
         for p in self._providers:
             if p.name == name:
-                self._providers.remove(p)
-                if not any(pp.name != "builtin" for pp in self._providers):
-                    self._has_external = False
-                # Clean up tool routing table
-                self._tool_to_provider = {
-                    t: pr for t, pr in self._tool_to_provider.items()
-                    if pr.name != name
-                }
-                return True
-        return False
+                return p
+        return None
+
+    def remove_provider(self, name: str) -> bool:
+        """Deregister a memory provider by name. Returns True if removed."""
+        if name == "builtin":
+            logger.warning("Cannot remove builtin memory provider")
+            return False
+
+        with self._lock:
+            for i, p in enumerate(self._providers):
+                if p.name == name:
+                    # Remove tool mappings
+                    tools_to_remove = [t for t, prov in self._tool_to_provider.items() if prov is p]
+                    for t in tools_to_remove:
+                        del self._tool_to_provider[t]
+
+                    # Shutdown the provider
+                    try:
+                        p.shutdown()
+                    except Exception as exc:
+                        logger.warning("Provider '%s' shutdown failed: %s", name, exc)
+
+                    self._providers.pop(i)
+                    logger.info("Memory provider '%s' removed (had %d tools)", name, len(tools_to_remove))
+                    return True
+
+            logger.warning("Provider '%s' not found for removal", name)
+            return False
 
     # -- System prompt -------------------------------------------------------
 
@@ -423,12 +465,7 @@ class MemoryManager:
         return "\n\n".join(parts)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
-        """Queue background prefetch on all providers for the next turn.
-
-        Provider work is dispatched to a background worker so a slow or
-        wedged provider can never block the caller. See ``sync_all`` for
-        the full rationale (agent stuck "running" minutes after a turn).
-        """
+        """Queue background prefetch on all providers for the next turn."""
         providers = list(self._providers)
         if not providers:
             return
@@ -467,23 +504,7 @@ class MemoryManager:
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Sync a completed turn to all providers.
-
-        Runs on a background worker thread, NOT inline on the
-        turn-completion path. A provider's ``sync_turn`` may make a
-        blocking network/daemon call (a misconfigured Hindsight daemon
-        was observed blocking ~298s before failing); doing that inline
-        held ``run_conversation`` open long after the user saw their
-        response, so every interface (CLI, TUI, gateway) kept the agent
-        marked "running" for minutes and any follow-up message triggered
-        an aggressive interrupt. Dispatching off-thread means a slow or
-        broken provider can never stall the turn — the sync simply
-        completes (or fails, logged) in the background.
-
-        Writes are serialized through a single worker so turn N lands
-        before turn N+1; provider implementations don't need their own
-        ordering guarantees.
-        """
+        """Sync a completed turn to all providers (background thread)."""
         providers = list(self._providers)
         if not providers:
             return
@@ -493,15 +514,12 @@ class MemoryManager:
                 try:
                     if messages is not None and self._provider_sync_accepts_messages(provider):
                         provider.sync_turn(
-                            user_content,
-                            assistant_content,
-                            session_id=session_id,
-                            messages=messages,
+                            user_content, assistant_content,
+                            session_id=session_id, messages=messages,
                         )
                     else:
                         provider.sync_turn(
-                            user_content,
-                            assistant_content,
+                            user_content, assistant_content,
                             session_id=session_id,
                         )
                 except Exception as e:
@@ -512,36 +530,7 @@ class MemoryManager:
 
         self._submit_background(_run)
 
-    # -- Background dispatch -------------------------------------------------
-
-    def _submit_background(self, fn) -> None:
-        """Run ``fn`` on the manager's background worker.
-
-        The executor is created lazily and shared across calls. If the
-        executor can't be created or has already been shut down, ``fn``
-        runs inline as a last-resort fallback — losing the async benefit
-        but never losing the write itself. ``fn`` must do its own
-        per-provider error handling; this wrapper only guards executor
-        plumbing.
-        """
-        executor = self._get_sync_executor()
-        if executor is None:
-            # Executor unavailable (shut down / creation failed) — run
-            # inline rather than drop the work. Slow, but correct.
-            try:
-                fn()
-            except Exception as e:  # pragma: no cover - fn guards internally
-                logger.debug("Inline memory background task failed: %s", e)
-            return
-        try:
-            executor.submit(fn)
-        except RuntimeError:
-            # Executor was shut down between the get and the submit
-            # (teardown race). Fall back to inline.
-            try:
-                fn()
-            except Exception as e:  # pragma: no cover - fn guards internally
-                logger.debug("Inline memory background task failed: %s", e)
+    # -- Background executor ---------------------------------------------------
 
     def _get_sync_executor(self) -> Optional[ThreadPoolExecutor]:
         """Lazily create the single-worker background executor."""
@@ -554,33 +543,76 @@ class MemoryManager:
                         max_workers=1,
                         thread_name_prefix="mem-sync",
                     )
-                except Exception as e:  # pragma: no cover - resource exhaustion
+                except Exception as e:
                     logger.warning("Failed to create memory sync executor: %s", e)
                     return None
             return self._sync_executor
 
-    def flush_pending(self, timeout: Optional[float] = None) -> bool:
-        """Block until queued sync/prefetch work has drained.
+    def _submit_background(self, fn) -> None:
+        """Run ``fn`` on the manager's background worker."""
+        executor = self._get_sync_executor()
+        if executor is None:
+            try:
+                fn()
+            except Exception as e:
+                logger.debug("Inline memory background task failed: %s", e)
+            return
+        try:
+            executor.submit(fn)
+        except RuntimeError:
+            try:
+                fn()
+            except Exception as e:
+                logger.debug("Inline memory background task failed: %s", e)
 
-        Single-worker executor means submitting a sentinel and waiting on
-        it guarantees every previously-submitted task has run. Returns
-        True if the barrier completed within ``timeout`` (or no executor
-        exists), False on timeout. Used at real session boundaries and by
-        tests that need to assert provider state deterministically.
-        """
+    def flush_pending(self, timeout: Optional[float] = None) -> bool:
+        """Block until queued sync/prefetch work has drained."""
         executor = self._sync_executor
         if executor is None:
             return True
         try:
             fut = executor.submit(lambda: None)
         except RuntimeError:
-            # Executor already shut down — nothing pending.
             return True
         try:
             fut.result(timeout=timeout)
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _bounded_executor_wait(executor: ThreadPoolExecutor) -> None:
+        try:
+            executor.shutdown(wait=True)
+        except Exception as e:
+            logger.debug("Memory sync executor drain wait failed: %s", e)
+
+    def _drain_sync_executor(self) -> None:
+        """Shut down the background executor, waiting briefly for drain."""
+        with self._sync_executor_lock:
+            executor = self._sync_executor
+            self._sync_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                executor.shutdown(wait=False)
+            except Exception as e:
+                logger.debug("Memory sync executor shutdown failed: %s", e)
+            return
+        except Exception as e:
+            logger.debug("Memory sync executor shutdown failed: %s", e)
+            return
+        drainer = threading.Thread(
+            target=lambda: self._bounded_executor_wait(executor),
+            daemon=True,
+            name="mem-sync-drain",
+        )
+        drainer.start()
+        drainer.join(timeout=_SYNC_DRAIN_TIMEOUT_S)
+
 
     # -- Tools ---------------------------------------------------------------
 
@@ -589,26 +621,16 @@ class MemoryManager:
 
         If *toolsets_enabled* is provided and does not contain ``'memory'``,
         skip memory tools entirely (they depend on the memory toolset).
-
-        Reserved core tool names (``clarify``, ``delegate_task``, etc.) are
-        skipped — they are rejected from the routing table in
-        :meth:`add_provider`, so the manager must not advertise a schema it
-        will never route. Built-ins always win (#40466).
         """
         if toolsets_enabled is not None and 'memory' not in toolsets_enabled:
             return []
 
-        from toolsets import _HERMES_CORE_TOOLS
-
-        _core_tool_names = set(_HERMES_CORE_TOOLS)
         schemas = []
         seen = set()
         for provider in self._providers:
             try:
                 for schema in provider.get_tool_schemas():
                     name = schema.get("name", "")
-                    if name in _core_tool_names:
-                        continue
                     if name and name not in seen:
                         schemas.append(schema)
                         seen.add(name)
@@ -617,6 +639,15 @@ class MemoryManager:
                     "Memory provider '%s' get_tool_schemas() failed: %s",
                     provider.name, e,
                 )
+
+        TOOL_BUDGET_WARN_THRESHOLD = 20
+        total_memory_tools = len(self._tool_to_provider)
+        if total_memory_tools > TOOL_BUDGET_WARN_THRESHOLD:
+            logger.warning(
+                "Memory tool budget: %d tools registered (threshold: %d). May degrade tool-calling accuracy.",
+                total_memory_tools, TOOL_BUDGET_WARN_THRESHOLD,
+            )
+
         return schemas
 
     def get_all_tool_names(self) -> set:
@@ -812,14 +843,7 @@ class MemoryManager:
                 )
 
     def shutdown_all(self) -> None:
-        """Shut down all providers (reverse order for clean teardown).
-
-        Drains the background sync/prefetch executor first (bounded by
-        ``_SYNC_DRAIN_TIMEOUT_S``) so a turn's final sync has a chance to
-        land before providers are torn down. The worker threads are
-        daemon, so anything still wedged past the drain window dies with
-        the interpreter rather than blocking exit.
-        """
+        """Shut down all providers (reverse order for clean teardown)."""
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
@@ -829,52 +853,6 @@ class MemoryManager:
                     "Memory provider '%s' shutdown failed: %s",
                     provider.name, e,
                 )
-
-    def _drain_sync_executor(self) -> None:
-        """Shut down the background executor, waiting briefly for drain.
-
-        Bounded by ``_SYNC_DRAIN_TIMEOUT_S``: a wedged provider must never
-        hang process/session teardown. We stop accepting new work and
-        cancel anything still queued, then wait at most the drain timeout
-        for the currently-running task on a watcher thread. The worker is
-        daemon, so an over-running task dies with the interpreter.
-        """
-        with self._sync_executor_lock:
-            executor = self._sync_executor
-            self._sync_executor = None
-        if executor is None:
-            return
-        try:
-            # Stop accepting new work and drop anything still queued, but
-            # do NOT block here — cancel_futures cancels not-yet-started
-            # tasks; the in-flight one keeps running on its daemon thread.
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            # Older Python without cancel_futures kwarg.
-            try:
-                executor.shutdown(wait=False)
-            except Exception as e:  # pragma: no cover
-                logger.debug("Memory sync executor shutdown failed: %s", e)
-            return
-        except Exception as e:  # pragma: no cover
-            logger.debug("Memory sync executor shutdown failed: %s", e)
-            return
-        # Give an in-flight sync a bounded chance to finish on a watcher
-        # thread so we don't block the caller past the drain timeout.
-        drainer = threading.Thread(
-            target=lambda: self._bounded_executor_wait(executor),
-            daemon=True,
-            name="mem-sync-drain",
-        )
-        drainer.start()
-        drainer.join(timeout=_SYNC_DRAIN_TIMEOUT_S)
-
-    @staticmethod
-    def _bounded_executor_wait(executor: ThreadPoolExecutor) -> None:
-        try:
-            executor.shutdown(wait=True)
-        except Exception as e:  # pragma: no cover
-            logger.debug("Memory sync executor drain wait failed: %s", e)
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
         """Initialize all providers.

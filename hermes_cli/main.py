@@ -7406,6 +7406,35 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
     return True
 
 
+def _stop_desktop_processes_locking_build(desktop_dir) -> list:
+    import sys as _sys
+    if _sys.platform != "win32":
+        return []
+    release_dir = desktop_dir / "release" / "win-unpacked"
+    if not release_dir.is_dir():
+        return []
+    import psutil
+    our_pid = os.getpid()
+    release_prefix = str(release_dir.resolve())
+    targets = []
+    for p in psutil.process_iter(["pid"]):
+        try:
+            exe = p.exe()
+        except Exception:
+            continue
+        if exe and os.path.normpath(exe).startswith(release_prefix) and p.pid != our_pid:
+            targets.append(p)
+    if not targets:
+        return []
+    for p in targets:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    psutil.wait_procs(targets, timeout=5)
+    return [p.pid for p in targets]
+
+
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
@@ -8375,6 +8404,19 @@ OFFICIAL_REPO_URLS = {
 }
 OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
+
+
+def _discard_stashed_changes(git_cmd: list[str], cwd: Path) -> bool:
+    """Drop stashed local changes without restoring them."""
+    try:
+        subprocess.run(
+            [*git_cmd, "stash", "drop"],
+            cwd=cwd, check=False,
+            capture_output=True, text=True,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:

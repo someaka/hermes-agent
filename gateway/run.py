@@ -751,6 +751,13 @@ def _collect_auto_append_media_tags(
     return media_tags, has_voice_directive
 
 # ---------------------------------------------------------------------------
+def render_notice_line(notice) -> str:
+    try:
+        return str(getattr(notice, "text", "") or "").strip()
+    except Exception:
+        return ""
+
+
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
 # ---------------------------------------------------------------------------
@@ -1203,7 +1210,26 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": _resolve_max_tokens_from_config(),
     }
+
+
+def _resolve_max_tokens_from_config() -> int | None:
+    import os
+    env_val = os.environ.get("HERMES_MAX_TOKENS")
+    if env_val:
+        try:
+            v = int(env_val)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    from hermes_cli.config import load_config
+    cfg = load_config()
+    m = cfg.get("model", {})
+    if isinstance(m.get("max_tokens"), int) and m["max_tokens"] > 0:
+        return m["max_tokens"]
+    return None
 
 
 def _try_resolve_fallback_provider() -> dict | None:
@@ -2558,6 +2584,15 @@ class GatewayRunner:
                     return recovered
                 return None
         return None
+
+    def _normalize_source_for_session_key(self, source: SessionSource) -> SessionSource:
+        try:
+            recovered = self._recover_telegram_topic_thread_id(source)
+        except Exception:
+            return source
+        if recovered is not None:
+            return dataclasses.replace(source, thread_id=recovered)
+        return source
 
     def _resolve_session_agent_runtime(
         self,

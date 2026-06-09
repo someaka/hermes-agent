@@ -3530,6 +3530,10 @@ class HermesCLI:
             self._last_invalidate = now
             self._app.invalidate()
 
+    def _paint_now(self) -> None:
+        if hasattr(self, "_app") and self._app:
+            self._app.invalidate()
+
     def _force_full_redraw(self) -> None:
         """Force a clean full-screen repaint of the prompt_toolkit UI.
 

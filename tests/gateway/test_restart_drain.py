@@ -121,8 +121,8 @@ def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monk
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
 
-    # No knobs set → follows busy_input_mode, which defaults to interrupt.
-    assert gateway_run.GatewayRunner._load_busy_text_mode() == "interrupt"
+    # No knobs set → fork defaults to queue.
+    assert gateway_run.GatewayRunner._load_busy_text_mode() == "queue"
 
     # busy_input_mode=queue propagates to text handling (single source of truth).
     (tmp_path / "config.yaml").write_text(
@@ -144,9 +144,9 @@ def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monk
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "queue")
     assert gateway_run.GatewayRunner._load_busy_text_mode() == "queue"
 
-    # Bogus legacy value is ignored → falls through to busy_input_mode (interrupt).
+    # Bogus legacy value is ignored → falls through to default (queue).
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "bogus")
-    assert gateway_run.GatewayRunner._load_busy_text_mode() == "interrupt"
+    assert gateway_run.GatewayRunner._load_busy_text_mode() == "queue"
 
 
 def test_load_restart_drain_timeout_prefers_env_then_config_then_default(

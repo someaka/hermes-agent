@@ -1824,6 +1824,7 @@ class GatewayRunner:
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+    _BUSY_QUEUE_MAX_PENDING: int = 32
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref

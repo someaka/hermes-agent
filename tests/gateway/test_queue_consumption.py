@@ -8,6 +8,7 @@ after the agent finishes its current task — not silently dropped.
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
 
 from gateway.run import _dequeue_pending_event
 from gateway.platforms.base import (
@@ -390,6 +391,7 @@ class TestBusyInputModeQueueFifo:
             message_id=f"m-{text}",
         )
 
+    @pytest.mark.skip(reason="fork: uses merge_pending_message_event, not FIFO queue")
     def test_rapid_text_followups_are_queued_in_fifo_order(self):
         """Five rapid texts in queue mode must all survive (none silently dropped)."""
         runner, adapter = self._make_runner_and_adapter()
@@ -409,6 +411,7 @@ class TestBusyInputModeQueueFifo:
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
 
+    @pytest.mark.skip(reason="fork: uses merge_pending_message_event, not FIFO queue")
     def test_queue_respects_bounded_cap(self):
         """Beyond the per-session cap, follow-ups are dropped (with a warning)."""
         from gateway.run import GatewayRunner

@@ -3,8 +3,10 @@ from hermes_cli.active_sessions import (
     active_session_registry_snapshot,
     try_acquire_active_session,
 )
+import pytest
 
 
+@pytest.mark.skip(reason="fork: max concurrent sessions cap intentionally removed")
 def test_cli_claim_active_session_respects_global_limit(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     cfg = {"max_concurrent_sessions": 1}

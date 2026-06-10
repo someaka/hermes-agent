@@ -30,13 +30,10 @@ def test_gateway_runner_inherits_mixin():
     # Import here so a heavy gateway import only happens if the first test passed.
     from gateway.run import GatewayRunner
 
-    assert issubclass(GatewayRunner, GatewayKanbanWatchersMixin)
-    # Each kanban method resolves to the mixin's implementation via the MRO.
+    # Fork: kanban methods are inlined directly on GatewayRunner rather than
+    # inheriting them from GatewayKanbanWatchersMixin.
     for m in KANBAN_METHODS:
-        owner = next(c for c in GatewayRunner.__mro__ if m in c.__dict__)
-        assert owner is GatewayKanbanWatchersMixin, (
-            f"{m} resolved to {owner.__name__}, expected the mixin"
-        )
+        assert hasattr(GatewayRunner, m), f"GatewayRunner missing kanban method {m}"
 
 
 def test_watcher_loops_are_coroutines():

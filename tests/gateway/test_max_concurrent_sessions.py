@@ -99,6 +99,7 @@ def _silence_global_gateway_hooks(monkeypatch):
     monkeypatch.setattr("tools.approval.has_blocking_approval", lambda *args, **kwargs: False)
 
 
+@pytest.mark.skip(reason="fork: max concurrent sessions cap intentionally removed")
 def test_new_session_gets_clean_error_at_active_session_limit(monkeypatch):
     _silence_global_gateway_hooks(monkeypatch)
     runner = _make_runner(max_concurrent_sessions=1)
@@ -172,6 +173,7 @@ def test_status_command_bypasses_active_session_limit(monkeypatch):
     runner._handle_status_command.assert_awaited_once()
 
 
+@pytest.mark.skip(reason="fork: max concurrent sessions cap intentionally removed")
 def test_skill_command_that_would_start_agent_is_blocked_at_limit(monkeypatch):
     _silence_global_gateway_hooks(monkeypatch)
     runner = _make_runner(max_concurrent_sessions=1)

@@ -8629,7 +8629,7 @@ class GatewayRunner:
                     )
 
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
+                message_text, transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
                 )
@@ -9740,9 +9740,11 @@ class GatewayRunner:
                 _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
+                agent_persisted_fallback = self._session_db is not None
                 self.session_store.append_to_transcript(
                     session_entry.session_id,
                     _user_entry,
+                    skip_db=agent_persisted_fallback,
                 )
             else:
                 history_len = agent_result.get("history_offset", len(history))
@@ -9753,9 +9755,11 @@ class GatewayRunner:
                     _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
+                    agent_persisted_fallback = self._session_db is not None
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
                         _user_entry,
+                        skip_db=agent_persisted_fallback,
                     )
                     if response:
                         self.session_store.append_to_transcript(
@@ -12271,11 +12275,12 @@ class GatewayRunner:
             if not tts_text:
                 return
 
-            # Use .mp3 extension so edge-tts conversion to opus works correctly.
-            # The TTS tool may convert to .ogg — use file_path from result.
+            # Use .ogg extension for Telegram (native voice bubbles require OGG/Opus).
+            # Other platforms keep the existing MP3 default.
+            audio_ext = "ogg" if event.source.platform == Platform.TELEGRAM else "mp3"
             audio_path = os.path.join(
                 tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
+                f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}",
             )
             os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
@@ -14872,9 +14877,9 @@ class GatewayRunner:
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
-        Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
-        Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
-        Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
+        Platform.TELEGRAM, Platform.SLACK, Platform.WHATSAPP,
+        Platform.SIGNAL, Platform.MATRIX,
+        Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
@@ -15688,7 +15693,7 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
-    ) -> str:
+    ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
@@ -15698,7 +15703,12 @@ class GatewayRunner:
             audio_paths: List of local file paths to cached audio files.
 
         Returns:
-            The enriched message string with transcriptions prepended.
+            A tuple of ``(enriched_text, successful_transcripts)``:
+              - ``enriched_text``: the message string with transcription wrappers
+                prepended (same as before).
+              - ``successful_transcripts``: the raw transcript strings for audio
+                clips that were successfully transcribed, in input order. Empty
+                list if every clip failed or STT is disabled.
         """
         if not getattr(self.config, "stt_enabled", True):
             notes = []
@@ -15712,24 +15722,26 @@ class GatewayRunner:
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
             if not notes:
-                return user_text
+                return user_text, []
             prefix = "\n\n".join(notes)
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
+                return prefix, []
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
+                return f"{prefix}\n\n{user_text}", []
+            return prefix, []
 
         from tools.transcription_tools import transcribe_audio
 
         enriched_parts = []
+        transcripts = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    transcripts.append(transcript)
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
@@ -15772,11 +15784,11 @@ class GatewayRunner:
             # when we successfully transcribed the audio — it's redundant.
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
+                return prefix, transcripts
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+                return f"{prefix}\n\n{user_text}", transcripts
+            return prefix, transcripts
+        return user_text, transcripts
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.

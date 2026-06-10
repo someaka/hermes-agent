@@ -3,6 +3,7 @@ import concurrent.futures
 import contextvars
 import copy
 import inspect
+import io
 import json
 import logging
 import os
@@ -136,6 +137,34 @@ try:
 except (ValueError, TypeError):
     _slash_timeout = 45.0
 _SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
+
+
+class _DropTransport:
+    """Discard sink for detached websocket sessions.
+
+    Desktop embeds the gateway in-process and captures stdout into logs, so
+    stale JSON-RPC frames must not fall through there while the session waits
+    for resume or reap.
+    """
+
+    def write(self, data: str) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation
+
+
+# Detached websocket sessions use a drop sink instead of stdio.
+_detached_ws_transport = _DropTransport()
 
 # When a WebSocket client (the dashboard's embedded-chat tab / desktop app)
 # disconnects, ``tui_gateway.ws`` detaches the transport but intentionally
@@ -544,16 +573,15 @@ def _teardown_session(session: dict | None) -> None:
 def _ws_session_is_orphaned(session: dict | None) -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
-    After ``handle_ws`` detaches a disconnected client it points the session
-    at ``_stdio_transport``. In the dashboard's in-process gateway there is no
-    real stdio peer reading those frames, so a session left on the stdio
-    transport (and not mid-turn) is genuinely orphaned and safe to reap.
+    After ``handle_ws`` detaches a disconnected client it points the session at
+    ``_detached_ws_transport``. A session left on that transport (and not
+    mid-turn) is genuinely orphaned and safe to reap.
     """
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
         return False
-    return session.get("transport") is _stdio_transport
+    return session.get("transport") is _detached_ws_transport
 
 
 def _schedule_ws_orphan_reap(sid: str) -> None:
@@ -580,6 +608,45 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
     timer.start()
+
+
+def _close_sessions_for_transport(
+    transport, *, end_reason: str = "ws_disconnect"
+) -> tuple[int, int]:
+    """On transport disconnect, reap the sessions that opted into
+    close_on_disconnect (sidecar/dashboard) immediately, and re-point the
+    rest to the drop sentinel so later emits don't hit a dead socket.
+
+    Non-flagged detached sessions are handed to the grace-windowed WS-orphan
+    reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
+    that re-binds a live transport cancels the reap, otherwise the orphan is
+    torn down through the same idempotent ``_teardown_session`` path. This is
+    the single WS-disconnect teardown entry point.
+
+    Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    with _sessions_lock:
+        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+    reaped = 0
+    detached = 0
+    for sid, session in owned:
+        if session.get("close_on_disconnect"):
+            # Pop from _sessions under lock to avoid races
+            with _sessions_lock:
+                if _sessions.get(sid) is session:
+                    _sessions.pop(sid, None)
+            _teardown_session(session)
+            reaped += 1
+        else:
+            # Point detached sessions at the drop sentinel (NOT real stdio) so
+            # _ws_session_is_orphaned recognizes them and the grace-reap can
+            # actually fire.
+            session["transport"] = _detached_ws_transport
+            detached += 1
+            try:
+                _schedule_ws_orphan_reap(sid)
+            except Exception:
+                pass
+    return reaped, detached
 
 
 def _shutdown_sessions() -> None:

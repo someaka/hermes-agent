@@ -164,11 +164,9 @@ class TestBusySessionAck:
             result = await GatewayRunner._handle_message(runner, event)
             assert result is None
 
-        assert adapter._pending_messages[sk].text == "first"
-        assert [event.text for event in runner._queued_events[sk]] == [
-            "second",
-            "third",
-        ]
+        assert adapter._pending_messages[sk].text == "first\nsecond\nthird"
+        # Fork: uses merge_pending_message_event (text-merge), not FIFO queue.
+        # All follow-ups merge into the single pending slot.
         agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio

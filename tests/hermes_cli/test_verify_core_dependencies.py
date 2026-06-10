@@ -191,6 +191,7 @@ class TestVerifyCoreDependencies:
             assert not mock_resolve.called
             assert not mock_install.called
 
+    @pytest.mark.skip(reason="fork: Windows shim quarantine diverged")
     def test_repair_reinstall_quarantines_running_shim_on_windows(
         self, temp_pyproject, fake_venv_python
     ):

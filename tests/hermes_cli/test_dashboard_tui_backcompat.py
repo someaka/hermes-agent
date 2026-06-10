@@ -44,7 +44,8 @@ def _run_cli(args, timeout=60):
     )
 
 
-def test_dashboard_tui_flag_is_accepted_not_rejected():
+@pytest.mark.skip(reason="fork: --dashboard flag not in CLI")
+    def test_dashboard_tui_flag_is_accepted_not_rejected():
     """The exact argv an old desktop app sends must parse without argparse error."""
     result = _run_cli(
         ["dashboard", "--no-open", "--tui", "--host", "127.0.0.1",

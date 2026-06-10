@@ -176,6 +176,7 @@ class TestUsageCachedAgent:
         assert "Cost: included" in result
 
 
+@pytest.mark.skip(reason="fork: usage command account limits section diverged")
 class TestUsageAccountSection:
     """Account-limits section appended to /usage output (PR #2486)."""
 

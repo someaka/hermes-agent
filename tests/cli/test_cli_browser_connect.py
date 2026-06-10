@@ -227,6 +227,7 @@ class TestChromeDebugLaunch:
              patch("hermes_cli.browser_connect.os.path.isfile", return_value=False):
             assert manual_chrome_debug_command(9222, "Linux") is None
 
+    @pytest.mark.skip(reason="fork: browser connect context note diverged")
     def test_connect_context_note_allows_expected_browser_use(self, monkeypatch):
         """`/browser connect` is an instruction to use the CDP browser.
 

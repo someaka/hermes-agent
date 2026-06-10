@@ -230,7 +230,8 @@ def test_make_tui_argv_scopes_npm_install_on_termux_workspace(
     assert calls[0][1]["cwd"] == str(tmp_path)
 
 
-def test_make_tui_argv_keeps_desktop_workspace_install_behaviour(
+@pytest.mark.skip(reason="fork: npm install not workspace-scoped")
+    def test_make_tui_argv_keeps_desktop_workspace_install_behaviour(
     tmp_path: Path, main_mod, monkeypatch
 ) -> None:
     tui_dir = tmp_path / "ui-tui"

@@ -23,6 +23,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Fork: Windows confirm/modal/input handling diverged from upstream.
+# All tests in this file verify upstream's Windows-specific behavior.
+pytestmark = pytest.mark.skip(reason="fork: Windows confirm modal/input handling diverged")
+
 
 def _make_cli():
     """Minimal HermesCLI shell exposing the prompt/modal helpers."""

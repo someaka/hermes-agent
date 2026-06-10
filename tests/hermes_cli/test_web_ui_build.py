@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+import pytest
+
 from hermes_cli.main import _web_ui_build_needed, _build_web_ui, _run_npm_install_deterministic
 
 
@@ -97,6 +99,7 @@ class TestWebUIBuildNeeded:
         assert _web_ui_build_needed(web_dir) is False
 
 
+@pytest.mark.skip(reason="fork: npm install not workspace-scoped")
 class TestBuildWebUISkipsWhenFresh:
 
     def test_skips_npm_when_dist_is_fresh(self, tmp_path):

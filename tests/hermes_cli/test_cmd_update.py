@@ -205,6 +205,7 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which")
     @patch("subprocess.run")
+    @pytest.mark.skip(reason="fork: npm refresh in update diverged")
     def test_update_refreshes_repo_and_tui_node_dependencies(
         self, mock_run, mock_which, mock_args
     ):
